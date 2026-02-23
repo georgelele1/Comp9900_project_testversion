@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# ConnectOnion
+.co/
+
+# Uploads
+uploads/
+
+# macOS
+.DS_Store
+
+# Audio files
+*.wav
+*.m4a
+
+# Xcode
+DerivedData/
+build/
