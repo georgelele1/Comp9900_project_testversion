@@ -17,13 +17,11 @@ struct ContentView: View {
 
             HStack(spacing: 12) {
 
-                // 🎙 Record Button
                 Button(audio.isRecording ? "Stop Recording" : "Start Recording") {
                     if audio.isRecording {
                         audio.stopRecording()
-
                         if let url = audio.outputURL {
-                            statusText = "Saved:\n\(url.path)"
+                            statusText = "Saved:\n\(url.lastPathComponent)\n\(url.path)"
                         } else {
                             statusText = "No file URL"
                         }
@@ -37,19 +35,14 @@ struct ContentView: View {
                     }
                 }
 
-                // 🚀 Upload Button
-                Button("Upload → Transcribe") {
-                    Task {
-                        await uploadRecording()
-                    }
+                Button("Transcribe") {
+                    Task { await uploadRecording() }
                 }
             }
         }
         .frame(width: 560, height: 260)
         .padding()
     }
-
-    // MARK: - Upload Logic
 
     @MainActor
     private func uploadRecording() async {
@@ -74,16 +67,23 @@ struct ContentView: View {
                              forHTTPHeaderField: "Content-Type")
 
             var body = Data()
+
+            // (Optional) extra fields if your backend accepts them
+            body.appendFormField(named: "mode", value: "clean", boundary: boundary)
+            body.appendFormField(named: "context", value: "generic", boundary: boundary)
+            body.appendFormField(named: "prompt", value: "", boundary: boundary)
+
+            // ✅ Correct: upload as .m4a
             body.append("--\(boundary)\r\n")
-            body.append("Content-Disposition: form-data; name=\"file\"; filename=\"whispr_recording.wav\"\r\n")
-            body.append("Content-Type: audio/wav\r\n\r\n")
+            body.append("Content-Disposition: form-data; name=\"file\"; filename=\"whispr_recording.m4a\"\r\n")
+            body.append("Content-Type: audio/mp4\r\n\r\n")
             body.append(fileData)
             body.append("\r\n")
             body.append("--\(boundary)--\r\n")
 
             request.httpBody = body
 
-            statusText = "Uploading..."
+            statusText = "Uploading…"
 
             let (data, response) = try await URLSession.shared.data(for: request)
 
@@ -93,7 +93,8 @@ struct ContentView: View {
             }
 
             guard (200...299).contains(http.statusCode) else {
-                statusText = "Backend error: \(http.statusCode)"
+                let errBody = String(data: data, encoding: .utf8) ?? "(no body)"
+                statusText = "Backend error: \(http.statusCode)\n\(errBody)"
                 return
             }
 
@@ -106,11 +107,16 @@ struct ContentView: View {
     }
 }
 
-// Helper extension for multipart
+// MARK: - Multipart helpers
 private extension Data {
     mutating func append(_ string: String) {
-        if let data = string.data(using: .utf8) {
-            append(data)
-        }
+        if let data = string.data(using: .utf8) { append(data) }
+    }
+
+    mutating func appendFormField(named name: String, value: String, boundary: String) {
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+        append(value)
+        append("\r\n")
     }
 }
