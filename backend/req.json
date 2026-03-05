@@ -1,0 +1,9 @@
+﻿{
+  "tool": "transcribe_and_enhance",
+  "args": {
+    "audio_path": "C:/Users/Georgelele/OneDrive/桌面/9900/recordtest.m4a",
+    "mode": "clean",
+    "context": "generic",
+    "prompt": ""
+  }
+}
