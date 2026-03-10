@@ -24,7 +24,14 @@ payload = {
         "audio_path": "./Test.wav",  # <-- Changed to a simple, local path
         "mode": "clean",
         "context": "generic",
-        "prompt": ""
+        "prompt": "You are Whispr. Improve the transcript.\n"
+                    "Rules:\n"
+                    "- Do NOT add new facts.\n"
+                    "- Do NOT change meaning.\n"
+                    "- Fix punctuation, capitalization, and grammar.\n"
+                    "- Remove filler words (um/uh/like/you know), stutters, and repeated fragments.\n"
+                    "- Resolve false starts and self-corrections (keep only the corrected version).\n"
+                    "- Output ONLY the final improved text. No quotes. No commentary."
     }
 }
 
