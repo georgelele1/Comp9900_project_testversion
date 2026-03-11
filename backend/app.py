@@ -126,7 +126,7 @@ def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
 
 
 # =========================================================
-# Tool registration helper (works across CO versions)
+# Tool registration helper
 # =========================================================
 
 def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
@@ -633,6 +633,93 @@ Output only the final enhanced text.
 
 
 # =========================================================
+# Core reusable implementation
+# =========================================================
+
+def transcribe_and_enhance_impl(
+    audio_path: str,
+    mode: str = "clean",
+    context: str = "generic",
+    prompt: str = "",
+) -> Dict[str, Any]:
+    mode = str(mode or "clean").strip().lower()
+    context = str(context or "generic").strip().lower()
+
+    if mode not in {"off", "clean", "formal"}:
+        mode = "clean"
+    if context not in {"generic", "email", "chat", "code"}:
+        context = "generic"
+
+    audio_path = str(Path(audio_path).expanduser())
+
+    if not Path(audio_path).exists():
+        return {
+            "ok": False,
+            "error": f"audio file not found: {audio_path}",
+            "ts": now_ms(),
+        }
+
+    stt_prompt = build_dictionary_prompt(prompt)
+
+    if stt_prompt:
+        raw = transcribe(audio_path, prompt=stt_prompt)
+    else:
+        raw = transcribe(audio_path)
+
+    raw_text = str(raw).strip()
+
+    dict_update_result = auto_update_dictionary_from_recent_texts(raw_text)
+    normalized_text = apply_dictionary_corrections(raw_text)
+
+    if mode == "off":
+        backtrace_text = normalized_text
+        final_text = normalized_text
+    else:
+        try:
+            backtrace_text = ai_backtrace_correct(
+                text=normalized_text,
+                context=context,
+                mode=mode,
+            )
+        except Exception:
+            backtrace_text = normalized_text
+
+        backtrace_text = apply_dictionary_corrections(backtrace_text)
+
+        try:
+            final_text = ai_enhance_text(
+                text=backtrace_text,
+                context=context,
+                mode=mode,
+            )
+        except Exception:
+            final_text = backtrace_text
+
+        final_text = apply_dictionary_corrections(final_text)
+
+    append_history({
+        "ts": now_ms(),
+        "audio_path": audio_path,
+        "raw_text": raw_text,
+        "normalized_text": normalized_text,
+        "backtrace_text": backtrace_text,
+        "final_text": final_text,
+        "context": context,
+        "mode": mode,
+    })
+
+    return {
+        "ok": True,
+        "raw_text": raw_text,
+        "normalized_text": normalized_text,
+        "backtrace_text": backtrace_text,
+        "final_text": final_text,
+        "dictionary_update": dict_update_result,
+        "ts": now_ms(),
+    }
+
+
+# =========================================================
 # Agent factory
 # =========================================================
 
@@ -706,80 +793,16 @@ def create_agent() -> Agent:
 
     def transcribe_and_enhance(
         audio_path: str,
-        mode: str = "clean",        # off | clean | formal
-        context: str = "generic",   # generic | email | chat | code
-        prompt: str = "",           # STT prompt (domain terms)
+        mode: str = "clean",
+        context: str = "generic",
+        prompt: str = "",
     ) -> Dict[str, Any]:
-        mode = str(mode or "clean").strip().lower()
-        context = str(context or "generic").strip().lower()
-
-        if mode not in {"off", "clean", "formal"}:
-            mode = "clean"
-        if context not in {"generic", "email", "chat", "code"}:
-            context = "generic"
-
-        # Step 1: STT prompt uses existing dictionary + profile
-        stt_prompt = build_dictionary_prompt(prompt)
-
-        # Step 2: Transcribe
-        if stt_prompt:
-            raw = transcribe(audio_path, prompt=stt_prompt)
-        else:
-            raw = transcribe(audio_path)
-
-        raw_text = str(raw).strip()
-
-        # Step 3: Update dictionary from current raw text + recent 10 texts
-        dict_update_result = auto_update_dictionary_from_recent_texts(raw_text)
-
-        # Step 4: Dictionary-based normalization using updated dictionary
-        normalized_text = apply_dictionary_corrections(raw_text)
-
-        if mode == "off":
-            backtrace_text = normalized_text
-            final_text = normalized_text
-        else:
-            # Step 5: AI backtrace correction, using dictionary context
-            backtrace_text = ai_backtrace_correct(
-                text=normalized_text,
-                context=context,
-                mode=mode,
-            )
-
-            # Step 6: Re-apply dictionary corrections
-            backtrace_text = apply_dictionary_corrections(backtrace_text)
-
-            # Step 7: Final AI enhancement, also using dictionary context
-            final_text = ai_enhance_text(
-                text=backtrace_text,
-                context=context,
-                mode=mode,
-            )
-
-            # Step 8: Final dictionary normalization again
-            final_text = apply_dictionary_corrections(final_text)
-
-        # Step 9: Save history
-        append_history({
-            "ts": now_ms(),
-            "audio_path": audio_path,
-            "raw_text": raw_text,
-            "normalized_text": normalized_text,
-            "backtrace_text": backtrace_text,
-            "final_text": final_text,
-            "context": context,
-            "mode": mode,
-        })
-
-        return {
-            "ok": True,
-            "raw_text": raw_text,
-            "normalized_text": normalized_text,
-            "backtrace_text": backtrace_text,
-            "final_text": final_text,
-            "dictionary_update": dict_update_result,
-            "ts": now_ms(),
-        }
+        return transcribe_and_enhance_impl(
+            audio_path=audio_path,
+            mode=mode,
+            context=context,
+            prompt=prompt,
+        )
 
     register_tool(agent, create_or_update_profile)
     register_tool(agent, get_profile)
@@ -796,12 +819,42 @@ def create_agent() -> Agent:
 # =========================================================
 
 if __name__ == "__main__":
-    addr = load(Path(".co"))
-    my_agent_address = addr["address"]
+    if len(sys.argv) > 1 and sys.argv[1] == "cli":
+        if len(sys.argv) < 3:
+            print(json.dumps({
+                "ok": False,
+                "error": "usage: python app.py cli <audio_path> [mode] [context] [prompt]"
+            }, ensure_ascii=False))
+            sys.exit(1)
 
-    host(
-        create_agent,
-        relay_url=None,
-        whitelist=[my_agent_address],
-        blacklist=[],
-    )
+        audio_path = sys.argv[2]
+        mode = sys.argv[3] if len(sys.argv) > 3 else "clean"
+        context = sys.argv[4] if len(sys.argv) > 4 else "generic"
+        prompt = sys.argv[5] if len(sys.argv) > 5 else ""
+
+        try:
+            result = transcribe_and_enhance_impl(
+                audio_path=audio_path,
+                mode=mode,
+                context=context,
+                prompt=prompt,
+            )
+            print(json.dumps(result, ensure_ascii=False))
+        except Exception as e:
+            print(json.dumps({
+                "ok": False,
+                "error": str(e),
+                "ts": now_ms(),
+            }, ensure_ascii=False))
+            sys.exit(1)
+
+    else:
+        addr = load(Path(".co"))
+        my_agent_address = addr["address"]
+
+        host(
+            create_agent,
+            relay_url=None,
+            whitelist=[my_agent_address],
+            blacklist=[],
+        )
