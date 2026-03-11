@@ -8,22 +8,26 @@ from connectonion.network.connect import RemoteAgent
 
 HTTP_BASE = "http://127.0.0.1:8000"
 
-# Load the REAL signing key + address from .co
-addr = load(Path(".co"))
+# Resolve paths safely
+co_path = Path(".co")
+audio_path = str(Path("test.wav").resolve())
+
+# Load signing key + address
+addr = load(co_path)
 keys = {
     "address": addr["address"],
     "signing_key": addr["signing_key"],
 }
 
-# Use RemoteAgent only to build a correctly signed message
+# Build signed remote call
 ra = RemoteAgent(HTTP_BASE, keys=keys)
 
 payload = {
     "tool": "transcribe_and_enhance",
     "args": {
         "audio_path": "./Test.wav",  # <-- Changed to a simple, local path
-        "mode": "formal",
-        "context": "chat",
+        "mode": "clean",
+        "context": "generic",
         "prompt": "You are Whispr. Improve the transcript.\n"
                     "Rules:\n"
                     "- Do NOT add new facts.\n"
@@ -35,13 +39,11 @@ payload = {
     }
 }
 
-# Generate a unique ID for every run to bypass replay protection
 unique_id = f"local-test-{uuid.uuid4()}"
 
-# Build the signed input message using the UNIQUE ID
-msg = ra._build_input_message(json.dumps(payload), input_id=unique_id, is_direct=True)
+msg = ra._build_input_message(json.dumps(payload), input_id=unique_id)
 
 resp = requests.post(f"{HTTP_BASE}/input", json=msg, timeout=300)
 
 print("STATUS:", resp.status_code)
-print(resp.text)
+print("BODY:", resp.text)
