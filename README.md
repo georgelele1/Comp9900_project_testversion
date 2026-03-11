@@ -48,7 +48,7 @@ All communication occurs locally through **localhost**.
 
 ### Backend
 
-- Python **3.10 or 3.11**
+- Python **3.11**
 - pip
 - macOS for frontend development
 
