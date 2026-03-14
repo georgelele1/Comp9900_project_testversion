@@ -20,3 +20,5 @@ uploads/
 # Xcode
 DerivedData/
 build/
+xcuserdata/
+*.xcuserstate
