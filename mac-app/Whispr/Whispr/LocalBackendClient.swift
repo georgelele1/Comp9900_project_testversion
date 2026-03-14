@@ -14,7 +14,7 @@ final class LocalBackendClient: ObservableObject {
         "/usr/bin/python3"
     ]
 
-    private let timeout: TimeInterval = 20
+    private let timeout: TimeInterval = 120
 
     private var pythonPath: String?
     private var backendScriptPath: String?
@@ -28,34 +28,31 @@ final class LocalBackendClient: ObservableObject {
 
         pythonPath = pythonCandidates.first(where: { fm.fileExists(atPath: $0) })
 
-        if let projectRoot = findProjectRoot() {
-            let candidate = projectRoot.appendingPathComponent("backend/app.py").path
+        if let root = findProjectRoot() {
+            let candidate = root.appendingPathComponent("backend/app.py").path
             if fm.fileExists(atPath: candidate) {
                 backendScriptPath = candidate
             }
         }
 
-        NSLog("python path = \(pythonPath ?? "nil")")
-        NSLog("backend path = \(backendScriptPath ?? "nil")")
+        print("python path =", pythonPath ?? "nil")
+        print("backend path =", backendScriptPath ?? "nil")
 
         isBackendAvailable = (pythonPath != nil && backendScriptPath != nil)
     }
 
     private func findProjectRoot() -> URL? {
         let fm = FileManager.default
-
-        // Start from current working directory
         var current = URL(fileURLWithPath: fm.currentDirectoryPath)
 
-        for _ in 0..<6 {
-            let backendPath = current.appendingPathComponent("backend/app.py").path
-            if fm.fileExists(atPath: backendPath) {
+        for _ in 0..<8 {
+            let backendCandidate = current.appendingPathComponent("backend/app.py").path
+            if fm.fileExists(atPath: backendCandidate) {
                 return current
             }
             current.deleteLastPathComponent()
         }
 
-        // Fallback: known project root on your machine
         let fallback = URL(fileURLWithPath: "/Users/yanbowang/Comp9900_project_testversion")
         let fallbackBackend = fallback.appendingPathComponent("backend/app.py").path
         if fm.fileExists(atPath: fallbackBackend) {
@@ -85,7 +82,6 @@ final class LocalBackendClient: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: pythonPath)
-
             process.arguments = [
                 backendScriptPath,
                 "cli",
@@ -99,29 +95,41 @@ final class LocalBackendClient: ObservableObject {
             let errorPipe = Pipe()
             process.standardOutput = outputPipe
             process.standardError = errorPipe
-            print("audio path =", fileURL.path)
-            print("file exists before run =", FileManager.default.fileExists(atPath: fileURL.path))
+
             do {
+                print("Launching backend...")
+                print("python =", pythonPath)
+                print("script =", backendScriptPath)
+                print("audio =", fileURL.path)
+                print("args =", process.arguments ?? [])
                 try process.run()
             } catch {
-                completion(.failure(error))
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
                 return
             }
 
-            let deadline = Date().addingTimeInterval(self.timeout)
-            while process.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.1)
+            let group = DispatchGroup()
+            group.enter()
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                process.waitUntilExit()
+                group.leave()
             }
 
-            if process.isRunning {
+            let waitResult = group.wait(timeout: .now() + self.timeout)
+            if waitResult == .timedOut {
                 process.terminate()
-                completion(.failure(
-                    NSError(
-                        domain: "LocalBackendClient",
-                        code: -2,
-                        userInfo: [NSLocalizedDescriptionKey: "Transcription timed out"]
-                    )
-                ))
+                DispatchQueue.main.async {
+                    completion(.failure(
+                        NSError(
+                            domain: "LocalBackendClient",
+                            code: -2,
+                            userInfo: [NSLocalizedDescriptionKey: "Transcription timed out"]
+                        )
+                    ))
+                }
                 return
             }
 
@@ -131,47 +139,49 @@ final class LocalBackendClient: ObservableObject {
             let outputString = String(data: outputData, encoding: .utf8) ?? ""
             let errorString = String(data: errorData, encoding: .utf8) ?? ""
 
-            if !errorString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                NSLog("Backend stderr: \(errorString)")
-            }
+            print("STDOUT:", outputString)
+            print("STDERR:", errorString)
+            print("Exit code:", process.terminationStatus)
 
-            if process.terminationStatus != 0 {
-                completion(.failure(
-                    NSError(
-                        domain: "LocalBackendClient",
-                        code: Int(process.terminationStatus),
-                        userInfo: [
-                            NSLocalizedDescriptionKey:
-                                errorString.isEmpty
-                                ? "Backend exited with code \(process.terminationStatus)"
-                                : errorString
-                        ]
-                    )
-                ))
-                return
-            }
+            DispatchQueue.main.async {
+                if process.terminationStatus != 0 {
+                    completion(.failure(
+                        NSError(
+                            domain: "LocalBackendClient",
+                            code: Int(process.terminationStatus),
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    errorString.isEmpty
+                                    ? "Backend exited with code \(process.terminationStatus)"
+                                    : errorString
+                            ]
+                        )
+                    ))
+                    return
+                }
 
-            let trimmed = outputString.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmed = outputString.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            if let data = trimmed.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let ok = json["ok"] as? Bool,
-               ok,
-               let finalText = json["final_text"] as? String {
-                completion(.success(finalText))
-                return
-            }
+                if let data = trimmed.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let ok = json["ok"] as? Bool,
+                   ok,
+                   let finalText = json["final_text"] as? String {
+                    completion(.success(finalText))
+                    return
+                }
 
-            if !trimmed.isEmpty {
-                completion(.success(trimmed))
-            } else {
-                completion(.failure(
-                    NSError(
-                        domain: "LocalBackendClient",
-                        code: -4,
-                        userInfo: [NSLocalizedDescriptionKey: "No output from backend"]
-                    )
-                ))
+                if !trimmed.isEmpty {
+                    completion(.success(trimmed))
+                } else {
+                    completion(.failure(
+                        NSError(
+                            domain: "LocalBackendClient",
+                            code: -4,
+                            userInfo: [NSLocalizedDescriptionKey: "No output from backend"]
+                        )
+                    ))
+                }
             }
         }
     }
