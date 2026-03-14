@@ -18,7 +18,9 @@ uploads/
 *.m4a
 
 # Xcode
+xcuserdata/
 DerivedData/
 build/
 xcuserdata/
 *.xcuserstate
+
