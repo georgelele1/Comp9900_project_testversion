@@ -18,5 +18,7 @@ uploads/
 *.m4a
 
 # Xcode
+xcuserdata/
 DerivedData/
 build/
+.DS_Store
