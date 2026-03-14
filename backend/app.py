@@ -75,6 +75,11 @@ def default_profile() -> Dict[str, Any]:
         "email": "z5603812@unsw.edu.au",
         "organization": "UNSW",
         "role": "Student",
+
+        "name": "yanbo",
+        "email": "georgelele@sina.com",
+        "organization": "UNSW",
+        "role": "student",
         "preferences": {
             "default_mode": "formal",
             "default_context": "generic",
