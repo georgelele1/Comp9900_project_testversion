@@ -22,6 +22,7 @@ final class AppManager: ObservableObject {
     func initialize() {
         hotkeyManager.setupGlobalHotkey { [weak self] shouldStart in
             guard let self else { return }
+
             if shouldStart {
                 self.startRecordingFromMenu()
             } else {
@@ -33,11 +34,14 @@ final class AppManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRecording in
                 guard let self else { return }
+
                 if isRecording {
                     self.updateAppStatus(.listening)
-                    self.floatingIndicator.showIndicator()
+                    // Temporarily disabled while debugging crash / window issues
+                    // self.floatingIndicator.showIndicator()
                 } else {
-                    self.floatingIndicator.hideIndicator()
+                    // Temporarily disabled while debugging crash / window issues
+                    // self.floatingIndicator.hideIndicator()
                 }
             }
             .store(in: &cancellables)
@@ -65,6 +69,7 @@ final class AppManager: ObservableObject {
 
     private func startRecording() {
         guard localBackendClient.isBackendAvailable else {
+            updateAppStatus(.error)
             showErrorAlert(message: "Python backend is not accessible")
             return
         }
@@ -86,6 +91,14 @@ final class AppManager: ObservableObject {
 
         updateAppStatus(.processing)
 
+        if FileManager.default.fileExists(atPath: audioFileURL.path) {
+            print("audio path =", audioFileURL.path)
+            print("file exists before run = true")
+        } else {
+            print("audio path =", audioFileURL.path)
+            print("file exists before run = false")
+        }
+
         localBackendClient.transcribeAudio(
             fileURL: audioFileURL,
             appName: currentActiveApp,
@@ -94,10 +107,6 @@ final class AppManager: ObservableObject {
             guard let self else { return }
 
             DispatchQueue.main.async {
-                //defer {
-                //    try? FileManager.default.removeItem(at: audioFileURL)
-               // }
-
                 switch result {
                 case .success(let text):
                     self.lastOutputText = text
@@ -108,6 +117,12 @@ final class AppManager: ObservableObject {
                     self.updateAppStatus(.error)
                     self.showErrorAlert(message: "Transcription failed: \(error.localizedDescription)")
                 }
+
+                // Keep temp file for debugging for now.
+                // Uncomment later after everything works.
+                /*
+                try? FileManager.default.removeItem(at: audioFileURL)
+                */
             }
         }
     }
@@ -141,6 +156,7 @@ final class AppManager: ObservableObject {
         pasteboard.setString(text, forType: .string)
 
         let source = CGEventSource(stateID: .hidSystemState)
+
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
         keyDown?.flags = .maskCommand
         keyDown?.post(tap: .cghidEventTap)
