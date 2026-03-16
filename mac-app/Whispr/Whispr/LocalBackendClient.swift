@@ -14,7 +14,7 @@ final class LocalBackendClient: ObservableObject {
         "/usr/bin/python3"
     ]
 
-    private let timeout: TimeInterval = 120
+    private let timeout: TimeInterval = 300
 
     private var pythonPath: String?
     private var backendScriptPath: String?
@@ -81,6 +81,7 @@ final class LocalBackendClient: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
+            process.currentDirectoryURL = URL(fileURLWithPath: backendScriptPath).deletingLastPathComponent()
             process.executableURL = URL(fileURLWithPath: pythonPath)
             process.arguments = [
                 backendScriptPath,
@@ -97,11 +98,13 @@ final class LocalBackendClient: ObservableObject {
             process.standardError = errorPipe
 
             do {
+                print("file exists before run =", FileManager.default.fileExists(atPath: fileURL.path))
                 print("Launching backend...")
                 print("python =", pythonPath)
                 print("script =", backendScriptPath)
                 print("audio =", fileURL.path)
                 print("args =", process.arguments ?? [])
+                print("cwd =", process.currentDirectoryURL?.path ?? "nil")
                 try process.run()
             } catch {
                 DispatchQueue.main.async {
@@ -144,41 +147,70 @@ final class LocalBackendClient: ObservableObject {
             print("Exit code:", process.terminationStatus)
 
             DispatchQueue.main.async {
-                if process.terminationStatus != 0 {
-                    completion(.failure(
-                        NSError(
-                            domain: "LocalBackendClient",
-                            code: Int(process.terminationStatus),
-                            userInfo: [
-                                NSLocalizedDescriptionKey:
-                                    errorString.isEmpty
-                                    ? "Backend exited with code \(process.terminationStatus)"
-                                    : errorString
-                            ]
-                        )
-                    ))
-                    return
-                }
-
                 let trimmed = outputString.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                if let data = trimmed.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let ok = json["ok"] as? Bool,
-                   ok,
-                   let finalText = json["final_text"] as? String {
-                    completion(.success(finalText))
-                    return
-                }
-
-                if !trimmed.isEmpty {
-                    completion(.success(trimmed))
-                } else {
+                guard !trimmed.isEmpty else {
                     completion(.failure(
                         NSError(
                             domain: "LocalBackendClient",
                             code: -4,
                             userInfo: [NSLocalizedDescriptionKey: "No output from backend"]
+                        )
+                    ))
+                    return
+                }
+
+                let lines = trimmed
+                    .components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+
+                guard let jsonLine = lines.last(where: { $0.hasPrefix("{") && $0.hasSuffix("}") }) else {
+                    completion(.failure(
+                        NSError(
+                            domain: "LocalBackendClient",
+                            code: -6,
+                            userInfo: [NSLocalizedDescriptionKey: "No JSON line found in backend output: \(trimmed)"]
+                        )
+                    ))
+                    return
+                }
+
+                guard let data = jsonLine.data(using: .utf8) else {
+                    completion(.failure(
+                        NSError(
+                            domain: "LocalBackendClient",
+                            code: -7,
+                            userInfo: [NSLocalizedDescriptionKey: "Failed to encode backend JSON line"]
+                        )
+                    ))
+                    return
+                }
+
+                do {
+                    let response = try JSONDecoder().decode(BackendResponse.self, from: data)
+
+                    if process.terminationStatus == 0 {
+                        completion(.success(response.output))
+                    } else {
+                        completion(.failure(
+                            NSError(
+                                domain: "LocalBackendClient",
+                                code: Int(process.terminationStatus),
+                                userInfo: [
+                                    NSLocalizedDescriptionKey: errorString.isEmpty
+                                        ? "Backend exited with code \(process.terminationStatus)"
+                                        : errorString
+                                ]
+                            )
+                        ))
+                    }
+                } catch {
+                    completion(.failure(
+                        NSError(
+                            domain: "LocalBackendClient",
+                            code: -8,
+                            userInfo: [NSLocalizedDescriptionKey: "Invalid JSON line from backend: \(jsonLine)"]
                         )
                     ))
                 }
