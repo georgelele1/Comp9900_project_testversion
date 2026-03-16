@@ -11,7 +11,8 @@ from typing import Any, Callable, Dict, List
 
 from connectonion.address import load
 from connectonion import Agent, host, transcribe
-
+BASE_DIR = Path(__file__).resolve().parent
+CO_DIR = BASE_DIR / ".co"
 APP_NAME = "Whispr"
 
 # =========================================================
@@ -902,27 +903,26 @@ def create_agent() -> Agent:
     register_tool(agent, get_supported_options)
 
     return agent
-
-
 # =========================================================
-# Main
+# CLI entry
 # =========================================================
 
 if __name__ == "__main__":
-        
+
     if len(sys.argv) > 1 and sys.argv[1] == "cli":
+
         if len(sys.argv) < 3:
-            print(json.dumps({
-                "ok": False,
-                "error": "usage: python app.py cli <audio_path> [mode] [context] [prompt]"
-            }, ensure_ascii=False))
+            print(json.dumps({"output": ""}, ensure_ascii=False))
             sys.exit(1)
-        print("PYTHON RECEIVED PATH:", sys.argv[2] if len(sys.argv) > 2 else "no path")
-        print("PYTHON FILE EXISTS:", os.path.exists(sys.argv[2]) if len(sys.argv) > 2 else False)
+
         audio_path = sys.argv[2]
         mode = sys.argv[3] if len(sys.argv) > 3 else "clean"
         context = sys.argv[4] if len(sys.argv) > 4 else "generic"
         prompt = sys.argv[5] if len(sys.argv) > 5 else ""
+
+        # debug → stderr only
+        print(f"PYTHON RECEIVED PATH: {audio_path}", file=sys.stderr)
+        print(f"FILE EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
 
         try:
             result = transcribe_and_enhance_impl(
@@ -931,17 +931,27 @@ if __name__ == "__main__":
                 context=context,
                 prompt=prompt,
             )
-            print(json.dumps(result, ensure_ascii=False))
-        except Exception as e:
+
+            final_text = result.get("final_text", "")
+
+            # stdout → ONLY JSON result
             print(json.dumps({
-                "ok": False,
-                "error": str(e),
-                "ts": now_ms(),
+                "output": final_text
             }, ensure_ascii=False))
+
+            sys.exit(0)
+
+        except Exception as e:
+
+            print(json.dumps({
+                "output": ""
+            }, ensure_ascii=False))
+
+            print(f"ERROR: {str(e)}", file=sys.stderr)
             sys.exit(1)
 
     else:
-        addr = load(Path(".co"))
+        addr = load(CO_DIR)
         my_agent_address = addr["address"]
 
         host(
