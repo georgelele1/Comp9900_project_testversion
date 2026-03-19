@@ -453,7 +453,7 @@ def extract_dictionary_candidates_with_agent(
         return []
 
     dictionary_agent = Agent(
-        model="co/gpt-5",
+        model="gpt-5",
         name="whispr_dictionary_builder",
         system_prompt=(
             "You extract personal dictionary candidates from recent transcripts.\n"
@@ -575,7 +575,7 @@ def ai_refine_text(text: str, context: str = "generic", mode: str = "clean") -> 
     context_instruction = get_context_instruction(context)
 
     agent = Agent(
-        model="co/gpt-5",
+        model="gpt-5",
         name="whispr_text_refiner",
         system_prompt=(
             "You are Whispr's text refinement agent.\n"
@@ -778,7 +778,7 @@ def transcribe_and_enhance(
 
 def create_agent() -> Agent:
     agent = Agent(
-        model="co/gpt-5",
+        model="gpt-5",
         name="whispr_orchestrator",
         system_prompt=(
             "You are Whispr. You orchestrate audio transcription, adaptive personal dictionary "
