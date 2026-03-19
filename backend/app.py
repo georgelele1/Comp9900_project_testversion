@@ -11,19 +11,48 @@ from typing import Any, Callable, Dict, List
 
 from connectonion.address import load
 from connectonion import Agent, host, transcribe
+
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR = BASE_DIR / ".co"
 APP_NAME = "Whispr"
 
-# =========================================================
-# Local storage
-# =========================================================
-
 PROFILE_FILE = "profile.json"
 DICTIONARY_FILE = "dictionary.json"
 HISTORY_FILE = "history.json"
+
 ALLOWED_MODES = {"off", "clean", "formal", "chat", "concise", "meeting", "email", "code"}
 ALLOWED_CONTEXTS = {"generic", "email", "chat", "code"}
+
+# Run dictionary auto-update only once every N transcriptions
+DICTIONARY_UPDATE_EVERY = 10
+
+# =========================================================
+# Stopwords: NLTK first, fallback second
+# =========================================================
+
+FALLBACK_STOPWORDS = {
+    "the", "and", "for", "are", "this", "that", "with", "have", "from",
+    "you", "your", "was", "were", "will", "can", "not", "but", "they",
+    "about", "just", "into", "then", "than", "when", "what", "where",
+    "how", "why", "our", "their", "his", "her", "she", "him", "them",
+    "hello", "okay", "yeah", "like", "um", "uh", "so", "well", "i",
+    "we", "he", "it", "is", "am", "be", "to", "of", "in", "on", "at",
+    "a", "an", "or", "if", "as", "by", "do", "did", "does", "done",
+    "me", "my", "mine", "ours", "yours", "theirs", "please", "thanks",
+    "thank", "today", "tomorrow", "yesterday", "also", "really", "very"
+}
+
+try:
+    from nltk.corpus import stopwords
+    STOPWORDS = set(stopwords.words("english"))
+except Exception:
+    STOPWORDS = set(FALLBACK_STOPWORDS)
+
+STOPWORDS.update({"um", "uh", "yeah", "okay", "hello", "please", "thanks", "thank"})
+
+# =========================================================
+# Paths / storage
+# =========================================================
 
 def app_support_dir() -> Path:
     home = Path.home()
@@ -37,16 +66,8 @@ def app_support_dir() -> Path:
     return base
 
 
-def profile_path() -> Path:
-    return app_support_dir() / PROFILE_FILE
-
-
-def dictionary_path() -> Path:
-    return app_support_dir() / DICTIONARY_FILE
-
-
-def history_path() -> Path:
-    return app_support_dir() / HISTORY_FILE
+def storage_path(filename: str) -> Path:
+    return app_support_dir() / filename
 
 
 def now_ms() -> int:
@@ -66,8 +87,15 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_store(filename: str, default: Any) -> Any:
+    return read_json(storage_path(filename), default)
+
+
+def save_store(filename: str, data: Any) -> None:
+    write_json(storage_path(filename), data)
+
 # =========================================================
-# Default data
+# Defaults
 # =========================================================
 
 def default_profile() -> Dict[str, Any]:
@@ -76,11 +104,6 @@ def default_profile() -> Dict[str, Any]:
         "email": "z5603812@unsw.edu.au",
         "organization": "UNSW",
         "role": "Student",
-
-        "name": "yanbo",
-        "email": "georgelele@sina.com",
-        "organization": "UNSW",
-        "role": "student",
         "preferences": {
             "default_mode": "formal",
             "default_context": "generic",
@@ -89,39 +112,31 @@ def default_profile() -> Dict[str, Any]:
 
 
 def default_dictionary() -> Dict[str, Any]:
-    return {
-        "terms": []
-    }
+    return {"terms": []}
 
 
 def default_history() -> Dict[str, Any]:
-    return {
-        "items": []
-    }
+    return {"items": []}
 
-
-# =========================================================
-# Load / Save helpers
-# =========================================================
 
 def load_profile() -> Dict[str, Any]:
-    return read_json(profile_path(), default_profile())
+    return load_store(PROFILE_FILE, default_profile())
 
 
 def save_profile(profile: Dict[str, Any]) -> None:
-    write_json(profile_path(), profile)
+    save_store(PROFILE_FILE, profile)
 
 
 def load_dictionary() -> Dict[str, Any]:
-    return read_json(dictionary_path(), default_dictionary())
+    return load_store(DICTIONARY_FILE, default_dictionary())
 
 
 def save_dictionary(data: Dict[str, Any]) -> None:
-    write_json(dictionary_path(), data)
+    save_store(DICTIONARY_FILE, data)
 
 
 def load_history() -> Dict[str, Any]:
-    return read_json(history_path(), default_history())
+    return load_store(HISTORY_FILE, default_history())
 
 
 def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
@@ -129,12 +144,35 @@ def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
     items = data.get("items", [])
     items.append(item)
     data["items"] = items[-max_items:]
-    write_json(history_path(), data)
-
+    save_store(HISTORY_FILE, data)
 
 # =========================================================
-# Tool registration helper
+# Common helpers
 # =========================================================
+
+def normalize_mode_context(mode: str = "clean", context: str = "generic") -> tuple[str, str]:
+    mode = str(mode or "clean").strip().lower()
+    context = str(context or "generic").strip().lower()
+
+    if mode not in ALLOWED_MODES:
+        mode = "clean"
+    if context not in ALLOWED_CONTEXTS:
+        context = "generic"
+
+    implied_context = {
+        "email": "email",
+        "chat": "chat",
+        "code": "code",
+    }
+    if context == "generic" and mode in implied_context:
+        context = implied_context[mode]
+
+    return mode, context
+
+
+def clean_agent_output(result: Any) -> str:
+    return str(result).strip().strip('"').strip("'").strip()
+
 
 def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
     if hasattr(agent, "add_tools") and callable(getattr(agent, "add_tools")):
@@ -154,23 +192,61 @@ def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
 
     raise RuntimeError("Cannot register tool: unknown connectonion tool API in this install.")
 
+# =========================================================
+# Instructions
+# =========================================================
+
+def get_refine_instruction(mode: str) -> str:
+    mode = str(mode or "clean").strip().lower()
+
+    instructions = {
+        "off": "Do not modify the transcript.",
+        "clean": (
+            "Remove false starts, repeated fragments, stutters, and obvious spoken disfluencies. "
+            "Then improve punctuation, capitalization, grammar, and readability while staying close to the original wording."
+        ),
+        "formal": (
+            "Remove false starts, repeated fragments, self-corrections, and spoken disfluencies. "
+            "Then rewrite in a polished, professional, and grammatically correct style."
+        ),
+        "chat": (
+            "Remove obvious false starts and repeated fragments, but keep the text natural and conversational. "
+            "Then improve readability lightly without making it sound stiff."
+        ),
+        "concise": (
+            "Remove false starts, repeated fragments, filler, and verbose spoken phrasing. "
+            "Then make the text shorter, clearer, and more direct while preserving meaning."
+        ),
+        "meeting": (
+            "Remove spoken disfluencies and improve structure so the text is easier to use for meeting notes or meeting follow-up."
+        ),
+        "email": (
+            "Remove spoken disfluencies and shape the text into a clean, professional email-ready form."
+        ),
+        "code": (
+            "Remove spoken disfluencies, but preserve technical terms, code snippets, commands, file paths, variable names, "
+            "product names, and version strings exactly. Improve readability without corrupting technical content."
+        ),
+    }
+
+    return instructions.get(mode, instructions["clean"])
+
+
+def get_context_instruction(context: str) -> str:
+    context = str(context or "generic").strip().lower()
+
+    instructions = {
+        "generic": "Use a neutral style suitable for general everyday text.",
+        "email": "Make the text suitable for email communication.",
+        "chat": "Make the text suitable for instant messaging or casual chat.",
+        "code": "Be careful with technical terms, code syntax, commands, file paths, and variable names.",
+    }
+
+    return instructions.get(context, instructions["generic"])
 
 # =========================================================
 # Dictionary utilities
 # =========================================================
-
-STOPWORDS = {
-    "the", "and", "for", "are", "this", "that", "with", "have", "from",
-    "you", "your", "was", "were", "will", "can", "not", "but", "they",
-    "about", "just", "into", "then", "than", "when", "what", "where",
-    "how", "why", "our", "their", "his", "her", "she", "him", "them",
-    "hello", "okay", "yeah", "like", "um", "uh", "so", "well", "i",
-    "we", "he", "it", "is", "am", "be", "to", "of", "in", "on", "at",
-    "a", "an", "or", "if", "as", "by", "do", "did", "does", "done",
-    "me", "my", "mine", "ours", "yours", "theirs", "please", "thanks",
-    "thank", "today", "tomorrow", "yesterday", "also", "really", "very"
-}
-
 
 def add_or_update_dictionary_entry(
     phrase: str,
@@ -184,20 +260,20 @@ def add_or_update_dictionary_entry(
     if not phrase:
         return {"ok": False, "error": "phrase is required"}
 
-    clean_aliases: List[str] = []
-    for a in aliases or []:
-        a = str(a).strip()
-        if a and a.lower() != phrase.lower():
-            clean_aliases.append(a)
+    clean_aliases = sorted({
+        str(a).strip()
+        for a in (aliases or [])
+        if str(a).strip() and str(a).strip().lower() != phrase.lower()
+    })
 
     data = load_dictionary()
     terms = data.get("terms", [])
 
     for item in terms:
         if str(item.get("phrase", "")).lower() == phrase.lower():
-            old_aliases = set(str(x).strip() for x in item.get("aliases", []) if str(x).strip())
-            old_aliases.update(clean_aliases)
-            item["aliases"] = sorted(old_aliases)
+            merged = set(str(x).strip() for x in item.get("aliases", []) if str(x).strip())
+            merged.update(clean_aliases)
+            item["aliases"] = sorted(merged)
             item["type"] = entry_type or item.get("type", "custom")
             item["source"] = source or item.get("source", "user")
             item["confidence"] = max(float(item.get("confidence", 0.0)), float(confidence))
@@ -207,7 +283,7 @@ def add_or_update_dictionary_entry(
 
     entry = {
         "phrase": phrase,
-        "aliases": sorted(set(clean_aliases)),
+        "aliases": clean_aliases,
         "type": entry_type or "custom",
         "source": source or "user",
         "confidence": float(confidence),
@@ -223,26 +299,19 @@ def apply_dictionary_corrections(text: str) -> str:
     if not text.strip():
         return text
 
-    data = load_dictionary()
     result = text
-
-    for item in data.get("terms", []):
+    for item in load_dictionary().get("terms", []):
         if not item.get("approved", True):
             continue
 
         phrase = str(item.get("phrase", "")).strip()
-        aliases = item.get("aliases", [])
-
         if not phrase:
             continue
 
-        for alias in aliases:
+        for alias in item.get("aliases", []):
             alias = str(alias).strip()
-            if not alias:
-                continue
-
-            pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
-            result = pattern.sub(phrase, result)
+            if alias:
+                result = re.sub(rf"\b{re.escape(alias)}\b", phrase, result, flags=re.IGNORECASE)
 
     return result
 
@@ -252,18 +321,16 @@ def build_dictionary_prompt(user_prompt: str = "", max_terms: int = 50) -> str:
     dictionary = load_dictionary()
 
     hints: List[str] = []
-
     for key in ("name", "organization", "role"):
-        v = str(profile.get(key, "")).strip()
-        if v:
-            hints.append(v)
+        value = str(profile.get(key, "")).strip()
+        if value:
+            hints.append(value)
 
     for item in dictionary.get("terms", []):
-        if not item.get("approved", True):
-            continue
-        phrase = str(item.get("phrase", "")).strip()
-        if phrase:
-            hints.append(phrase)
+        if item.get("approved", True):
+            phrase = str(item.get("phrase", "")).strip()
+            if phrase:
+                hints.append(phrase)
 
     deduped = list(dict.fromkeys(hints))[:max_terms]
 
@@ -271,7 +338,6 @@ def build_dictionary_prompt(user_prompt: str = "", max_terms: int = 50) -> str:
     if deduped:
         parts.append("Please pay attention to these names and domain-specific terms:")
         parts.append(", ".join(deduped))
-
     if str(user_prompt).strip():
         parts.append(str(user_prompt).strip())
 
@@ -279,11 +345,8 @@ def build_dictionary_prompt(user_prompt: str = "", max_terms: int = 50) -> str:
 
 
 def build_dictionary_context(max_terms: int = 50) -> str:
-    data = load_dictionary()
-    terms = data.get("terms", [])
-
     lines: List[str] = []
-    for item in terms[:max_terms]:
+    for item in load_dictionary().get("terms", [])[:max_terms]:
         if not item.get("approved", True):
             continue
 
@@ -294,32 +357,21 @@ def build_dictionary_context(max_terms: int = 50) -> str:
         if not phrase:
             continue
 
-        if aliases:
-            lines.append(f"- {phrase} (type: {entry_type}; aliases: {', '.join(aliases)})")
-        else:
-            lines.append(f"- {phrase} (type: {entry_type})")
+        suffix = f" (type: {entry_type}" + (f"; aliases: {', '.join(aliases)}" if aliases else "") + ")"
+        lines.append(f"- {phrase}{suffix}")
 
-    if not lines:
-        return "Personal dictionary: none"
-
-    return "Personal dictionary:\n" + "\n".join(lines)
-
+    return "Personal dictionary: none" if not lines else "Personal dictionary:\n" + "\n".join(lines)
 
 # =========================================================
-# Candidate extraction from recent 10 texts
+# Candidate extraction
 # =========================================================
 
 def get_recent_texts(limit: int = 10) -> List[str]:
-    history = load_history()
-    items = history.get("items", [])
-    texts: List[str] = []
-
-    for item in items[-limit:]:
-        txt = str(item.get("final_text", "")).strip()
-        if txt:
-            texts.append(txt)
-
-    return texts
+    return [
+        str(item.get("final_text", "")).strip()
+        for item in load_history().get("items", [])[-limit:]
+        if str(item.get("final_text", "")).strip()
+    ]
 
 
 def get_candidate_source_texts(current_raw_text: str, limit: int = 10) -> List[str]:
@@ -335,27 +387,19 @@ def tokenize_candidate_words(text: str) -> List[str]:
 
 
 def looks_like_domain_term(word: str) -> bool:
-    if any(c.isdigit() for c in word):
-        return True
-    if "-" in word or "_" in word:
-        return True
-    if word[:1].isupper():
-        return True
-    if sum(1 for c in word if c.isupper()) >= 2:
-        return True
-    return False
+    return (
+        any(c.isdigit() for c in word)
+        or "-" in word
+        or "_" in word
+        or word[:1].isupper()
+        or sum(1 for c in word if c.isupper()) >= 2
+    )
 
 
-def collect_candidate_terms_from_recent_texts(
-    texts: List[str],
-    min_count: int = 2,
-) -> List[Dict[str, Any]]:
+def collect_candidate_terms_from_recent_texts(texts: List[str], min_count: int = 2) -> List[Dict[str, Any]]:
     dictionary = load_dictionary()
 
-    existing_phrases = {
-        str(item.get("phrase", "")).lower()
-        for item in dictionary.get("terms", [])
-    }
+    existing_phrases = {str(item.get("phrase", "")).lower() for item in dictionary.get("terms", [])}
     existing_aliases = {
         str(alias).lower()
         for item in dictionary.get("terms", [])
@@ -367,48 +411,37 @@ def collect_candidate_terms_from_recent_texts(
     support_score: Dict[str, int] = {}
 
     for text in texts:
-        seen_in_this_text = set()
-        words = tokenize_candidate_words(text)
-        for w in words:
-            lw = w.lower()
-
-            if lw in STOPWORDS:
-                continue
-            if lw in existing_phrases or lw in existing_aliases:
-                continue
-            if len(w) < 3:
-                continue
-            if w.isdigit():
+        seen = set()
+        for word in tokenize_candidate_words(text):
+            lw = word.lower()
+            if (
+                lw in STOPWORDS
+                or lw in existing_phrases
+                or lw in existing_aliases
+                or len(word) < 3
+                or word.isdigit()
+            ):
                 continue
 
             counter[lw] += 1
-            original_forms.setdefault(lw, w)
+            original_forms.setdefault(lw, word)
 
-            if lw not in seen_in_this_text:
+            if lw not in seen:
                 support_score[lw] = support_score.get(lw, 0) + 1
-                seen_in_this_text.add(lw)
+                seen.add(lw)
 
-    candidates: List[Dict[str, Any]] = []
+    candidates = []
     for lw, count in counter.items():
-        if count < min_count:
-            continue
+        if count >= min_count:
+            phrase = original_forms[lw]
+            candidates.append({
+                "phrase": phrase,
+                "count": count,
+                "support_texts": support_score.get(lw, 1),
+                "domain_like": looks_like_domain_term(phrase),
+            })
 
-        phrase = original_forms[lw]
-        candidates.append({
-            "phrase": phrase,
-            "count": count,
-            "support_texts": support_score.get(lw, 1),
-            "domain_like": looks_like_domain_term(phrase),
-        })
-
-    candidates.sort(
-        key=lambda x: (
-            not x["domain_like"],
-            -x["support_texts"],
-            -x["count"],
-            x["phrase"].lower(),
-        )
-    )
+    candidates.sort(key=lambda x: (not x["domain_like"], -x["support_texts"], -x["count"], x["phrase"].lower()))
     return candidates
 
 
@@ -419,18 +452,13 @@ def extract_dictionary_candidates_with_agent(
     if not texts:
         return []
 
-    joined_text = "\n".join(texts[-10:])
-    candidate_hint = ", ".join(item["phrase"] for item in pre_candidates[:50])
-
     dictionary_agent = Agent(
         model="co/gpt-5",
         name="whispr_dictionary_builder",
         system_prompt=(
             "You extract personal dictionary candidates from recent transcripts.\n"
             "Return ONLY valid JSON in this format:\n"
-            "{\"terms\": ["
-            "{\"phrase\": \"...\", \"aliases\": [\"...\"], \"type\": \"technical\", \"confidence\": 0.9}"
-            "]}\n"
+            "{\"terms\": [{\"phrase\": \"...\", \"aliases\": [\"...\"], \"type\": \"technical\", \"confidence\": 0.9}]}\n"
             "Rules:\n"
             "- Do not invent facts.\n"
             "- Use only evidence from the transcript texts.\n"
@@ -443,18 +471,16 @@ def extract_dictionary_candidates_with_agent(
 
     prompt = f"""
 Recent transcript texts:
-{joined_text}
+{chr(10).join(texts[-10:])}
 
 Pre-filtered repeated candidate words:
-{candidate_hint}
+{", ".join(item["phrase"] for item in pre_candidates[:50])}
 
 Extract only useful personal dictionary terms.
 """.strip()
 
-    result = str(dictionary_agent.input(prompt)).strip()
-
     try:
-        data = json.loads(result)
+        data = json.loads(str(dictionary_agent.input(prompt)).strip())
         terms = data.get("terms", [])
         return terms if isinstance(terms, list) else []
     except Exception:
@@ -463,28 +489,20 @@ Extract only useful personal dictionary terms.
 
 def normalize_candidate_term(item: Dict[str, Any]) -> Dict[str, Any] | None:
     phrase = str(item.get("phrase", "")).strip()
-    aliases = item.get("aliases", [])
-    entry_type = str(item.get("type", "custom")).strip().lower()
     confidence = float(item.get("confidence", 0.0))
-
-    if not phrase or len(phrase) < 3:
-        return None
-    if confidence < 0.75:
-        return None
-    if phrase.lower() in STOPWORDS:
+    if not phrase or len(phrase) < 3 or confidence < 0.75 or phrase.lower() in STOPWORDS:
         return None
 
-    clean_aliases: List[str] = []
-    if isinstance(aliases, list):
-        for a in aliases:
-            a = str(a).strip()
-            if a and a.lower() != phrase.lower():
-                clean_aliases.append(a)
+    aliases = sorted({
+        str(a).strip()
+        for a in (item.get("aliases", []) if isinstance(item.get("aliases", []), list) else [])
+        if str(a).strip() and str(a).strip().lower() != phrase.lower()
+    })
 
     return {
         "phrase": phrase,
-        "aliases": sorted(set(clean_aliases)),
-        "type": entry_type or "custom",
+        "aliases": aliases,
+        "type": str(item.get("type", "custom")).strip().lower() or "custom",
         "source": "agent",
         "confidence": confidence,
         "approved": True,
@@ -533,17 +551,8 @@ def merge_agent_terms_into_dictionary(candidates: List[Dict[str, Any]]) -> Dict[
 
 def auto_update_dictionary_from_recent_texts(current_raw_text: str) -> Dict[str, Any]:
     texts = get_candidate_source_texts(current_raw_text=current_raw_text, limit=10)
-
-    pre_candidates = collect_candidate_terms_from_recent_texts(
-        texts=texts,
-        min_count=2,
-    )
-
-    agent_candidates = extract_dictionary_candidates_with_agent(
-        texts=texts,
-        pre_candidates=pre_candidates,
-    )
-
+    pre_candidates = collect_candidate_terms_from_recent_texts(texts=texts, min_count=2)
+    agent_candidates = extract_dictionary_candidates_with_agent(texts=texts, pre_candidates=pre_candidates)
     merged = merge_agent_terms_into_dictionary(agent_candidates)
 
     return {
@@ -553,83 +562,33 @@ def auto_update_dictionary_from_recent_texts(current_raw_text: str) -> Dict[str,
         "dictionary_update": merged,
     }
 
-
 # =========================================================
-# AI stages
+# Merged AI refine stage
 # =========================================================
 
-def ai_backtrace_correct(text: str, context: str = "generic", mode: str = "clean") -> str:
+def ai_refine_text(text: str, context: str = "generic", mode: str = "clean") -> str:
     if not text.strip():
         return text
 
     dictionary_context = build_dictionary_context()
-    mode_instruction = get_backtrace_instruction(mode)
+    refine_instruction = get_refine_instruction(mode)
     context_instruction = get_context_instruction(context)
 
     agent = Agent(
         model="co/gpt-5",
-        name="whispr_backtrace_corrector",
+        name="whispr_text_refiner",
         system_prompt=(
-            "You are Whispr's backtrace correction agent.\n"
-            "Your job is to correct false starts, repeated fragments, self-corrections, "
-            "stutters, and broken spoken structures.\n"
-            "Rules:\n"
-            "- Do NOT add new facts.\n"
-            "- Do NOT remove meaning.\n"
-            "- Preserve the intended message.\n"
-            "- Preserve personal dictionary terms exactly.\n"
-            "- Preserve technical tokens exactly when relevant.\n"
-            "- Output ONLY the corrected text.\n"
-        )
-    )
-
-    instruction = f"""
-Context: {context}
-Mode: {mode}
-
-Context instruction:
-{context_instruction}
-
-Mode instruction:
-{mode_instruction}
-
-{dictionary_context}
-
-Input transcript:
-{text}
-
-Task:
-Correct backtracking, false starts, repetitions, self-corrections, and stutters.
-Keep personal dictionary terms exactly as specified.
-Do not add new information.
-Output only the corrected text.
-""".strip()
-
-    result = str(agent.input(instruction)).strip()
-    return result.strip().strip('"').strip("'").strip()
-
-
-def ai_enhance_text(text: str, context: str = "generic", mode: str = "clean") -> str:
-    if not text.strip():
-        return text
-
-    dictionary_context = build_dictionary_context()
-    mode_instruction = get_mode_instruction(mode)
-    context_instruction = get_context_instruction(context)
-
-    agent = Agent(
-        model="co/gpt-5",
-        name="whispr_text_enhancer",
-        system_prompt=(
-            "You are Whispr's text enhancement agent.\n"
-            "Improve punctuation, capitalization, grammar, and readability.\n"
-            "Adapt style based on context and mode.\n"
+            "You are Whispr's text refinement agent.\n"
+            "Your job is to first correct false starts, repeated fragments, self-corrections, "
+            "stutters, filler-like spoken artifacts, and broken spoken structures.\n"
+            "Then improve punctuation, capitalization, grammar, clarity, and readability.\n"
             "Rules:\n"
             "- Do NOT add new facts.\n"
             "- Do NOT change meaning.\n"
             "- Preserve personal dictionary terms exactly.\n"
             "- Preserve technical tokens exactly when relevant.\n"
-            "- Output ONLY the final enhanced text.\n"
+            "- For code mode, preserve commands, code snippets, file paths, variable names, versions, and product names exactly.\n"
+            "- Output ONLY the final refined text.\n"
         )
     )
 
@@ -640,8 +599,8 @@ Mode: {mode}
 Context instruction:
 {context_instruction}
 
-Mode instruction:
-{mode_instruction}
+Refinement instruction:
+{refine_instruction}
 
 {dictionary_context}
 
@@ -649,66 +608,18 @@ Input text:
 {text}
 
 Task:
-Enhance the text for clarity and readability according to the context and mode.
+First remove backtracking, false starts, repeated fragments, self-corrections, stutters, and spoken disfluencies where appropriate.
+Then refine the text according to the requested mode and context.
 Keep dictionary phrases exactly as specified.
 Do not add new facts.
-Output only the final enhanced text.
+Output only the final refined text.
 """.strip()
 
     result = str(agent.input(instruction)).strip()
-    return result.strip().strip('"').strip("'").strip()
+    return clean_agent_output(result)
 
 # =========================================================
-# Helper
-# =========================================================
-def get_backtrace_instruction(mode: str) -> str:
-    mode = str(mode or "clean").strip().lower()
-
-    instructions = {
-        "off": "Do not modify the transcript.",
-        "clean": (
-            "Remove false starts, repeated fragments, stutters, and obvious spoken disfluencies only. "
-            "Keep the wording close to the original."
-        ),
-        "formal": (
-            "Remove false starts, repeated fragments, and spoken disfluencies. "
-            "Prepare the text for a polished and formal rewrite."
-        ),
-        "chat": (
-            "Remove obvious false starts and repeated fragments, but keep the text natural and conversational."
-        ),
-        "concise": (
-            "Remove false starts, repeated fragments, filler, and verbose spoken phrasing. "
-            "Make the source text tighter before enhancement."
-        ),
-        "meeting": (
-            "Remove spoken disfluencies and make the text easier to convert into structured meeting notes."
-        ),
-        "email": (
-            "Remove spoken disfluencies and shape the text into clean email-ready source content."
-        ),
-        "code": (
-            "Remove spoken disfluencies, but preserve technical terms, commands, code snippets, "
-            "file paths, variable names, and product names exactly."
-        ),
-    }
-
-    return instructions.get(mode, instructions["clean"])
-
-
-def get_context_instruction(context: str) -> str:
-    context = str(context or "generic").strip().lower()
-
-    instructions = {
-        "generic": "Use a neutral style suitable for general everyday text.",
-        "email": "Make the text suitable for email communication.",
-        "chat": "Make the text suitable for instant messaging or casual chat.",
-        "code": "Be careful with technical terms, code syntax, commands, file paths, and variable names.",
-    }
-
-    return instructions.get(context, instructions["generic"])
-# =========================================================
-# Core reusable implementation
+# Core
 # =========================================================
 
 def transcribe_and_enhance_impl(
@@ -717,19 +628,7 @@ def transcribe_and_enhance_impl(
     context: str = "generic",
     prompt: str = "",
 ) -> Dict[str, Any]:
-    mode = str(mode or "clean").strip().lower()
-    context = str(context or "generic").strip().lower()
-
-    if mode not in ALLOWED_MODES:
-        mode = "clean"
-    if context not in ALLOWED_CONTEXTS:
-        context = "generic"
-    if mode == "email" and context == "generic":
-        context = "email"
-    elif mode == "code" and context == "generic":
-        context = "code"
-    elif mode == "chat" and context == "generic":
-        context = "chat"
+    mode, context = normalize_mode_context(mode, context)
     audio_path = str(Path(audio_path).expanduser())
 
     if not Path(audio_path).exists():
@@ -740,50 +639,44 @@ def transcribe_and_enhance_impl(
         }
 
     stt_prompt = build_dictionary_prompt(prompt)
-
-    if stt_prompt:
-        raw = transcribe(audio_path, prompt=stt_prompt)
-    else:
-        raw = transcribe(audio_path)
-
+    raw = transcribe(audio_path, prompt=stt_prompt) if stt_prompt else transcribe(audio_path)
     raw_text = str(raw).strip()
 
-    dict_update_result = auto_update_dictionary_from_recent_texts(raw_text)
+    transcript_count = len(load_history().get("items", [])) + 1
+    if transcript_count % DICTIONARY_UPDATE_EVERY == 0:
+        dict_update_result = auto_update_dictionary_from_recent_texts(raw_text)
+    else:
+        dict_update_result = {
+            "ok": True,
+            "skipped": True,
+            "reason": f"dictionary auto-update runs every {DICTIONARY_UPDATE_EVERY} transcripts",
+            "current_transcript_index": transcript_count,
+            "next_run_in": DICTIONARY_UPDATE_EVERY - (transcript_count % DICTIONARY_UPDATE_EVERY),
+        }
+
     normalized_text = apply_dictionary_corrections(raw_text)
 
     if mode == "off":
-        backtrace_text = normalized_text
-        final_text = normalized_text
+        refined_text = normalized_text
     else:
         try:
-            backtrace_text = ai_backtrace_correct(
+            refined_text = ai_refine_text(
                 text=normalized_text,
                 context=context,
                 mode=mode,
             )
         except Exception:
-            backtrace_text = normalized_text
+            refined_text = normalized_text
 
-        backtrace_text = apply_dictionary_corrections(backtrace_text)
-
-        try:
-            final_text = ai_enhance_text(
-                text=backtrace_text,
-                context=context,
-                mode=mode,
-            )
-        except Exception:
-            final_text = backtrace_text
-
-        final_text = apply_dictionary_corrections(final_text)
+        refined_text = apply_dictionary_corrections(refined_text)
 
     append_history({
         "ts": now_ms(),
         "audio_path": audio_path,
         "raw_text": raw_text,
         "normalized_text": normalized_text,
-        "backtrace_text": backtrace_text,
-        "final_text": final_text,
+        "refined_text": refined_text,
+        "final_text": refined_text,
         "context": context,
         "mode": mode,
     })
@@ -792,12 +685,92 @@ def transcribe_and_enhance_impl(
         "ok": True,
         "raw_text": raw_text,
         "normalized_text": normalized_text,
-        "backtrace_text": backtrace_text,
-        "final_text": final_text,
+        "refined_text": refined_text,
+        "final_text": refined_text,
         "dictionary_update": dict_update_result,
         "ts": now_ms(),
     }
 
+# =========================================================
+# Tool functions
+# =========================================================
+
+def create_or_update_profile(
+    name: str = "",
+    email: str = "",
+    organization: str = "",
+    role: str = "",
+    default_mode: str = "clean",
+    default_context: str = "generic",
+) -> Dict[str, Any]:
+    profile = load_profile()
+
+    for key, value in {
+        "name": name,
+        "email": email,
+        "organization": organization,
+        "role": role,
+    }.items():
+        if str(value).strip():
+            profile[key] = str(value).strip()
+
+    mode, context = normalize_mode_context(default_mode, default_context)
+    profile["preferences"] = {
+        "default_mode": mode,
+        "default_context": context,
+    }
+
+    save_profile(profile)
+    return {"ok": True, "profile": profile}
+
+
+def get_profile() -> Dict[str, Any]:
+    return {"ok": True, "profile": load_profile()}
+
+
+def get_supported_options() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "modes": sorted(ALLOWED_MODES),
+        "contexts": sorted(ALLOWED_CONTEXTS),
+    }
+
+
+def add_dictionary_word(
+    phrase: str,
+    aliases: List[str] | None = None,
+    entry_type: str = "custom",
+) -> Dict[str, Any]:
+    return add_or_update_dictionary_entry(
+        phrase=phrase,
+        aliases=aliases,
+        entry_type=entry_type,
+        source="user",
+        confidence=1.0,
+        approved=True,
+    )
+
+
+def list_dictionary_words() -> Dict[str, Any]:
+    return {"ok": True, "dictionary": load_dictionary()}
+
+
+def scan_dictionary_candidates(current_text: str = "") -> Dict[str, Any]:
+    return auto_update_dictionary_from_recent_texts(current_text)
+
+
+def transcribe_and_enhance(
+    audio_path: str,
+    mode: str = "clean",
+    context: str = "generic",
+    prompt: str = "",
+) -> Dict[str, Any]:
+    return transcribe_and_enhance_impl(
+        audio_path=audio_path,
+        mode=mode,
+        context=context,
+        prompt=prompt,
+    )
 
 # =========================================================
 # Agent factory
@@ -809,110 +782,29 @@ def create_agent() -> Agent:
         name="whispr_orchestrator",
         system_prompt=(
             "You are Whispr. You orchestrate audio transcription, adaptive personal dictionary "
-            "updates, backtrace correction, and text enhancement."
+            "updates, and text refinement."
         ),
     )
 
-    def create_or_update_profile(
-        name: str = "",
-        email: str = "",
-        organization: str = "",
-        role: str = "",
-        default_mode: str = "clean",
-        default_context: str = "generic",
-    ) -> Dict[str, Any]:
-        profile = load_profile()
-
-        if str(name).strip():
-            profile["name"] = str(name).strip()
-        if str(email).strip():
-            profile["email"] = str(email).strip()
-        if str(organization).strip():
-            profile["organization"] = str(organization).strip()
-        if str(role).strip():
-            profile["role"] = str(role).strip()
-
-        mode = str(default_mode or "clean").strip().lower()
-        context = str(default_context or "generic").strip().lower()
-
-        if mode not in ALLOWED_MODES:
-            mode = "clean"
-        if context not in ALLOWED_CONTEXTS:
-            context = "generic"
-        if mode == "email" and context == "generic":
-            context = "email"
-        elif mode == "code" and context == "generic":
-            context = "code"
-        elif mode == "chat" and context == "generic":
-            context = "chat"
-        profile["preferences"] = {
-            "default_mode": mode,
-            "default_context": context,
-        }
-
-        save_profile(profile)
-        return {"ok": True, "profile": profile}
-    def get_supported_options() -> Dict[str, Any]:
-        return {
-            "ok": True,
-            "modes": sorted(ALLOWED_MODES),
-            "contexts": sorted(ALLOWED_CONTEXTS),
-        }
-    def get_profile() -> Dict[str, Any]:
-        return {"ok": True, "profile": load_profile()}
-
-    def add_dictionary_word(
-        phrase: str,
-        aliases: List[str] | None = None,
-        entry_type: str = "custom",
-    ) -> Dict[str, Any]:
-        return add_or_update_dictionary_entry(
-            phrase=phrase,
-            aliases=aliases,
-            entry_type=entry_type,
-            source="user",
-            confidence=1.0,
-            approved=True,
-        )
-
-    def list_dictionary_words() -> Dict[str, Any]:
-        return {"ok": True, "dictionary": load_dictionary()}
-
-    def scan_dictionary_candidates(current_text: str = "") -> Dict[str, Any]:
-        return auto_update_dictionary_from_recent_texts(current_text)
-
-    def transcribe_and_enhance(
-        audio_path: str,
-        mode: str = "clean",
-        context: str = "generic",
-        prompt: str = "",
-    ) -> Dict[str, Any]:
-        return transcribe_and_enhance_impl(
-            audio_path=audio_path,
-            mode=mode,
-            context=context,
-            prompt=prompt,
-        )
-
-    register_tool(agent, create_or_update_profile)
-    register_tool(agent, get_profile)
-    register_tool(agent, add_dictionary_word)
-    register_tool(agent, list_dictionary_words)
-    register_tool(agent, scan_dictionary_candidates)
-    register_tool(agent, transcribe_and_enhance)
-    register_tool(agent, get_supported_options)
+    for fn in (
+        create_or_update_profile,
+        get_profile,
+        add_dictionary_word,
+        list_dictionary_words,
+        scan_dictionary_candidates,
+        transcribe_and_enhance,
+        get_supported_options,
+    ):
+        register_tool(agent, fn)
 
     return agent
 
-
 # =========================================================
-# CLI entry
+# CLI / host
 # =========================================================
 
 if __name__ == "__main__":
-
     if len(sys.argv) > 1 and sys.argv[1] == "cli":
-
         if len(sys.argv) < 3:
             print(json.dumps({"output": ""}, ensure_ascii=False))
             sys.exit(1)
@@ -922,7 +814,6 @@ if __name__ == "__main__":
         context = sys.argv[4] if len(sys.argv) > 4 else "generic"
         prompt = sys.argv[5] if len(sys.argv) > 5 else ""
 
-        # debug → stderr only
         print(f"PYTHON RECEIVED PATH: {audio_path}", file=sys.stderr)
         print(f"FILE EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
 
@@ -934,21 +825,15 @@ if __name__ == "__main__":
                 prompt=prompt,
             )
 
-            final_text = result.get("final_text", "")
-
-            # stdout → ONLY JSON result
             print(json.dumps({
-                "output": final_text
+                "output": result.get("final_text", "")
             }, ensure_ascii=False))
-
             sys.exit(0)
 
         except Exception as e:
-
             print(json.dumps({
                 "output": ""
             }, ensure_ascii=False))
-
             print(f"ERROR: {str(e)}", file=sys.stderr)
             sys.exit(1)
 
