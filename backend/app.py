@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 from connectonion.address import load
-from connectonion import Agent, host
+from connectonion import Agent, host, transcribe
 
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR = BASE_DIR / ".co"
 APP_NAME = "Whispr"
 
+PROFILE_FILE = "profile.json"
 DICTIONARY_FILE = "dictionary.json"
 HISTORY_FILE = "history.json"
 
@@ -24,8 +27,7 @@ def app_support_dir() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
         base = home / "Library" / "Application Support" / APP_NAME
-    elif sys.platform == "win32":
-        import os
+    elif os.name == "nt":
         base = Path(os.environ.get("APPDATA", str(home))) / APP_NAME
     else:
         base = home / ".local" / "share" / APP_NAME
@@ -35,6 +37,10 @@ def app_support_dir() -> Path:
 
 def storage_path(filename: str) -> Path:
     return app_support_dir() / filename
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -50,16 +56,64 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_store(filename: str, default: Any) -> Any:
+    return read_json(storage_path(filename), default)
+
+
+def save_store(filename: str, data: Any) -> None:
+    write_json(storage_path(filename), data)
+
+# =========================================================
+# Defaults
+# =========================================================
+
+def default_profile() -> Dict[str, Any]:
+    return {
+        "name": "Yanbo",
+        "email": "z5603812@unsw.edu.au",
+        "organization": "UNSW",
+        "role": "Student",
+        "preferences": {},
+    }
+
+
+def default_dictionary() -> Dict[str, Any]:
+    return {"terms": []}
+
+
+def default_history() -> Dict[str, Any]:
+    return {"items": []}
+
+
+def load_profile() -> Dict[str, Any]:
+    return load_store(PROFILE_FILE, default_profile())
+
+
+def save_profile(profile: Dict[str, Any]) -> None:
+    save_store(PROFILE_FILE, profile)
+
+
 def load_dictionary() -> Dict[str, Any]:
-    return read_json(storage_path(DICTIONARY_FILE), {"terms": []})
-
-
-def save_dictionary(data: Dict[str, Any]) -> None:
-    write_json(storage_path(DICTIONARY_FILE), data)
+    return load_store(DICTIONARY_FILE, default_dictionary())
 
 
 def load_history() -> Dict[str, Any]:
-    return read_json(storage_path(HISTORY_FILE), {"items": []})
+    return load_store(HISTORY_FILE, default_history())
+
+
+def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
+    data = load_history()
+    items = data.get("items", [])
+    items.append(item)
+    data["items"] = items[-max_items:]
+    save_store(HISTORY_FILE, data)
+
+# =========================================================
+# Common helpers
+# =========================================================
+
+def clean_agent_output(result: Any) -> str:
+    return str(result).strip().strip('"').strip("'").strip()
 
 
 def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
@@ -81,103 +135,148 @@ def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
     raise RuntimeError("Cannot register tool: unknown connectonion tool API in this install.")
 
 # =========================================================
+# Dictionary corrections
+# =========================================================
+
+def apply_dictionary_corrections(text: str) -> str:
+    if not text.strip():
+        return text
+
+    result = text
+    for item in load_dictionary().get("terms", []):
+        if not item.get("approved", True):
+            continue
+
+        phrase = str(item.get("phrase", "")).strip()
+        if not phrase:
+            continue
+
+        for alias in item.get("aliases", []):
+            alias = str(alias).strip()
+            if alias:
+                result = re.sub(rf"\b{re.escape(alias)}\b", phrase, result, flags=re.IGNORECASE)
+
+    return result
+
+# =========================================================
+# AI refine
+# =========================================================
+
+def ai_refine_text(text: str, app_name: str = "") -> str:
+    if not text.strip():
+        return text
+
+    app_hint = f"The user is currently using {app_name.strip()}." if app_name.strip() else ""
+
+    agent = Agent(
+        model="gpt-5",
+        name="whispr_text_refiner",
+        system_prompt=(
+            "You are Whispr's text refinement agent.\n"
+            "You will be told which application the user is currently using. "
+            "Use that to infer the appropriate tone, formality, and context for the output "
+            "(e.g. code-safe for an IDE, professional for email, casual for chat).\n"
+            "Your job is to remove false starts, repeated fragments, self-corrections, "
+            "stutters, and spoken disfluencies, then improve punctuation, capitalization, "
+            "grammar, clarity, and readability to match that context.\n"
+            "Rules:\n"
+            "- Do NOT add new facts.\n"
+            "- Do NOT change meaning.\n"
+            "- Output ONLY the final refined text.\n"
+        )
+    )
+
+    instruction = f"""
+{app_hint}
+
+Input text:
+{text}
+
+Infer the appropriate tone and context from the application, then refine the text accordingly.
+Output only the final refined text.
+""".strip()
+
+    return clean_agent_output(agent.input(instruction))
+
+# =========================================================
+# Core
+# =========================================================
+
+def transcribe_and_enhance_impl(
+    audio_path: str,
+    app_name: str = "",
+) -> Dict[str, Any]:
+    audio_path = str(Path(audio_path).expanduser())
+
+    if not Path(audio_path).exists():
+        return {
+            "ok": False,
+            "error": f"audio file not found: {audio_path}",
+            "ts": now_ms(),
+        }
+
+    raw = transcribe(audio_path)
+    raw_text = str(raw).strip()
+
+    try:
+        final_text = apply_dictionary_corrections(
+            ai_refine_text(text=raw_text, app_name=app_name)
+        )
+    except Exception:
+        final_text = apply_dictionary_corrections(raw_text)
+
+    append_history({
+        "ts": now_ms(),
+        "audio_path": audio_path,
+        "raw_text": raw_text,
+        "final_text": final_text,
+        "app_name": app_name,
+    })
+
+    return {
+        "ok": True,
+        "raw_text": raw_text,
+        "final_text": final_text,
+        "ts": now_ms(),
+    }
+
+# =========================================================
 # Tool functions
 # =========================================================
 
-def get_recent_transcripts(limit: int = 20) -> Dict[str, Any]:
-    """Return the most recent transcript texts from history for analysis."""
-    items = load_history().get("items", [])
-    texts = [
-        str(item.get("final_text", "")).strip()
-        for item in items[-limit:]
-        if str(item.get("final_text", "")).strip()
-    ]
-    return {"ok": True, "texts": texts, "count": len(texts)}
-
-
-def get_dictionary() -> Dict[str, Any]:
-    """Return the current personal dictionary."""
-    return {"ok": True, "dictionary": load_dictionary()}
-
-
-def add_or_update_term(
-    phrase: str,
-    aliases: List[str] | None = None,
-    entry_type: str = "custom",
-    confidence: float = 1.0,
+def create_or_update_profile(
+    name: str = "",
+    email: str = "",
+    organization: str = "",
+    role: str = "",
 ) -> Dict[str, Any]:
-    """Add a new term or update an existing one in the personal dictionary."""
-    phrase = str(phrase or "").strip()
-    if not phrase:
-        return {"ok": False, "error": "phrase is required"}
+    profile = load_profile()
 
-    clean_aliases = sorted({
-        str(a).strip()
-        for a in (aliases or [])
-        if str(a).strip() and str(a).strip().lower() != phrase.lower()
-    })
+    for key, value in {
+        "name": name,
+        "email": email,
+        "organization": organization,
+        "role": role,
+    }.items():
+        if str(value).strip():
+            profile[key] = str(value).strip()
 
-    data = load_dictionary()
-    terms = data.get("terms", [])
-
-    for item in terms:
-        if str(item.get("phrase", "")).lower() == phrase.lower():
-            merged = set(str(x).strip() for x in item.get("aliases", []) if str(x).strip())
-            merged.update(clean_aliases)
-            item["aliases"] = sorted(merged)
-            item["type"] = entry_type or item.get("type", "custom")
-            item["confidence"] = max(float(item.get("confidence", 0.0)), float(confidence))
-            item["source"] = "agent"
-            item["approved"] = True
-            save_dictionary(data)
-            return {"ok": True, "updated": True, "entry": item}
-
-    entry = {
-        "phrase": phrase,
-        "aliases": clean_aliases,
-        "type": entry_type or "custom",
-        "source": "agent",
-        "confidence": float(confidence),
-        "approved": True,
-    }
-    terms.append(entry)
-    data["terms"] = terms
-    save_dictionary(data)
-    return {"ok": True, "updated": False, "entry": entry}
+    save_profile(profile)
+    return {"ok": True, "profile": profile}
 
 
-def remove_term(phrase: str) -> Dict[str, Any]:
-    """Remove a term from the personal dictionary."""
-    phrase = str(phrase or "").strip()
-    if not phrase:
-        return {"ok": False, "error": "phrase is required"}
-
-    data = load_dictionary()
-    terms = data.get("terms", [])
-    filtered = [t for t in terms if str(t.get("phrase", "")).lower() != phrase.lower()]
-
-    if len(filtered) == len(terms):
-        return {"ok": False, "error": f"term not found: {phrase}"}
-
-    data["terms"] = filtered
-    save_dictionary(data)
-    return {"ok": True, "removed": phrase, "total_terms": len(filtered)}
+def get_profile() -> Dict[str, Any]:
+    return {"ok": True, "profile": load_profile()}
 
 
-def approve_term(phrase: str, approved: bool = True) -> Dict[str, Any]:
-    """Approve or disable a term in the personal dictionary."""
-    phrase = str(phrase or "").strip()
-    if not phrase:
-        return {"ok": False, "error": "phrase is required"}
-
-    data = load_dictionary()
-    for item in data.get("terms", []):
-        if str(item.get("phrase", "")).lower() == phrase.lower():
-            item["approved"] = bool(approved)
-            save_dictionary(data)
-            return {"ok": True, "phrase": phrase, "approved": item["approved"]}
-
-    return {"ok": False, "error": f"term not found: {phrase}"}
+def transcribe_and_enhance(
+    audio_path: str,
+    app_name: str = "",
+) -> Dict[str, Any]:
+    return transcribe_and_enhance_impl(
+        audio_path=audio_path,
+        app_name=app_name,
+    )
 
 # =========================================================
 # Agent factory
@@ -186,47 +285,62 @@ def approve_term(phrase: str, approved: bool = True) -> Dict[str, Any]:
 def create_agent() -> Agent:
     agent = Agent(
         model="gpt-5",
-        name="whispr_dictionary_agent",
+        name="whispr_orchestrator",
         system_prompt=(
-            "You are Whispr's personal dictionary agent.\n"
-            "When asked to update the dictionary, use get_recent_transcripts to fetch recent "
-            "transcript history, then analyse the texts for recurring names, technical terms, "
-            "domain-specific phrases, and proper nouns that would benefit from being in the "
-            "personal dictionary.\n"
-            "Prioritise terms that:\n"
-            "- Appear repeatedly across multiple transcripts\n"
-            "- Are proper nouns, product names, project names, or organisation names\n"
-            "- Are technical or domain-specific and unlikely to be transcribed correctly without a hint\n"
-            "- Are not common everyday English words\n"
-            "Use add_or_update_term to save each candidate. Set confidence based on how strongly "
-            "the evidence supports the term. Include aliases for common mishearings or alternate "
-            "spellings if evident from the transcripts.\n"
-            "You can also add, remove, or approve individual terms when the user asks directly."
+            "You are Whispr. You orchestrate audio transcription and text refinement."
         ),
     )
 
     for fn in (
-        get_recent_transcripts,
-        get_dictionary,
-        add_or_update_term,
-        remove_term,
-        approve_term,
+        create_or_update_profile,
+        get_profile,
+        transcribe_and_enhance,
     ):
         register_tool(agent, fn)
 
     return agent
 
 # =========================================================
-# Host
+# CLI / host
 # =========================================================
 
 if __name__ == "__main__":
-    addr = load(CO_DIR)
-    my_agent_address = addr["address"]
+    if len(sys.argv) > 1 and sys.argv[1] == "cli":
+        if len(sys.argv) < 3:
+            print(json.dumps({"output": ""}, ensure_ascii=False))
+            sys.exit(1)
 
-    host(
-        create_agent,
-        relay_url=None,
-        whitelist=[my_agent_address],
-        blacklist=[],
-    )
+        audio_path = sys.argv[2]
+        app_name = sys.argv[3] if len(sys.argv) > 3 else ""
+
+        print(f"PYTHON RECEIVED PATH: {audio_path}", file=sys.stderr)
+        print(f"FILE EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
+
+        try:
+            result = transcribe_and_enhance_impl(
+                audio_path=audio_path,
+                app_name=app_name,
+            )
+
+            print(json.dumps({
+                "output": result.get("final_text", "")
+            }, ensure_ascii=False))
+            sys.exit(0)
+
+        except Exception as e:
+            print(json.dumps({
+                "output": ""
+            }, ensure_ascii=False))
+            print(f"ERROR: {str(e)}", file=sys.stderr)
+            sys.exit(1)
+
+    else:
+        addr = load(CO_DIR)
+        my_agent_address = addr["address"]
+
+        host(
+            create_agent,
+            relay_url=None,
+            whitelist=[my_agent_address],
+            blacklist=[],
+        )
