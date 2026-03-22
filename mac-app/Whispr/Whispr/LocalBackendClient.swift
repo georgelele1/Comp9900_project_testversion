@@ -62,10 +62,73 @@ final class LocalBackendClient: ObservableObject {
         return nil
     }
 
+    func runDictionaryUpdate(completion: @escaping (Result<String, Error>) -> Void) {
+        guard let pythonPath, let backendScriptPath else {
+            completion(.failure(NSError(
+                domain: "LocalBackendClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Python or backend script not found"]
+            )))
+            return
+        }
+
+        let dictionaryScriptPath = URL(fileURLWithPath: backendScriptPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("dictionary_agent.py")
+            .path
+
+        guard FileManager.default.fileExists(atPath: dictionaryScriptPath) else {
+            completion(.failure(NSError(
+                domain: "LocalBackendClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "dictionary_agent.py not found"]
+            )))
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.currentDirectoryURL = URL(fileURLWithPath: backendScriptPath).deletingLastPathComponent()
+            process.executableURL = URL(fileURLWithPath: pythonPath)
+            process.arguments = [dictionaryScriptPath, "cli", "update"]
+
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+
+            do {
+                print("Running dictionary update...")
+                try process.run()
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+
+            process.waitUntilExit()
+
+            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let outputString = String(data: outputData, encoding: .utf8) ?? ""
+            let errorString = String(data: errorData, encoding: .utf8) ?? ""
+
+            print("Dictionary STDOUT:", outputString)
+            print("Dictionary STDERR:", errorString)
+
+            DispatchQueue.main.async {
+                if process.terminationStatus == 0 {
+                    completion(.success(outputString.trimmingCharacters(in: .whitespacesAndNewlines)))
+                } else {
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient", code: Int(process.terminationStatus),
+                        userInfo: [NSLocalizedDescriptionKey: errorString.isEmpty ? "Dictionary update failed" : errorString]
+                    )))
+                }
+            }
+        }
+    }
+
     func transcribeAudio(
         fileURL: URL,
         appName: String,
-        mode: TranscriptionMode,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         guard let pythonPath, let backendScriptPath else {
@@ -87,9 +150,7 @@ final class LocalBackendClient: ObservableObject {
                 backendScriptPath,
                 "cli",
                 fileURL.path,
-                mode.rawValue,
-                self.contextFromAppName(appName),
-                ""
+                appName
             ]
 
             let outputPipe = Pipe()
@@ -103,6 +164,7 @@ final class LocalBackendClient: ObservableObject {
                 print("python =", pythonPath)
                 print("script =", backendScriptPath)
                 print("audio =", fileURL.path)
+                print("app name =", appName)
                 print("args =", process.arguments ?? [])
                 print("cwd =", process.currentDirectoryURL?.path ?? "nil")
                 try process.run()
@@ -215,19 +277,6 @@ final class LocalBackendClient: ObservableObject {
                     ))
                 }
             }
-        }
-    }
-
-    private func contextFromAppName(_ appName: String) -> String {
-        switch appName {
-        case "Mail", "Microsoft Outlook", "Spark":
-            return "email"
-        case "Messages", "Slack", "Discord", "Telegram", "WhatsApp":
-            return "chat"
-        case "Visual Studio Code", "Code", "Xcode", "Terminal", "iTerm2", "PyCharm":
-            return "code"
-        default:
-            return "generic"
         }
     }
 }

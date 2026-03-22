@@ -36,12 +36,10 @@ final class MenuBarController: NSObject {
 
         let statusItemMenu = NSMenuItem(title: "Status: Idle", action: nil, keyEquivalent: "")
         let currentAppItem = NSMenuItem(title: "Current App: Unknown", action: nil, keyEquivalent: "")
-        let currentModeItem = NSMenuItem(title: "Mode: Generic", action: nil, keyEquivalent: "")
         let lastResultItem = NSMenuItem(title: "Last Result: No transcription yet", action: nil, keyEquivalent: "")
 
         menu.addItem(statusItemMenu)
         menu.addItem(currentAppItem)
-        menu.addItem(currentModeItem)
         menu.addItem(lastResultItem)
 
         menu.addItem(.separator())
@@ -53,6 +51,12 @@ final class MenuBarController: NSObject {
         let stopItem = NSMenuItem(title: "Stop Recording", action: #selector(stopRecording), keyEquivalent: "s")
         stopItem.target = self
         menu.addItem(stopItem)
+
+        menu.addItem(.separator())
+
+        let updateDictItem = NSMenuItem(title: "Update Dictionary", action: #selector(updateDictionary), keyEquivalent: "d")
+        updateDictItem.target = self
+        menu.addItem(updateDictItem)
 
         let settingsItem = NSMenuItem(title: "Settings", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
@@ -87,13 +91,6 @@ final class MenuBarController: NSObject {
             }
             .store(in: &cancellables)
 
-        AppManager.shared.$currentTranscriptionMode
-            .receive(on: DispatchQueue.main)
-            .sink { mode in
-                currentModeItem.title = "Mode: \(mode.rawValue.capitalized)"
-            }
-            .store(in: &cancellables)
-
         AppManager.shared.$lastOutputText
             .receive(on: DispatchQueue.main)
             .sink { text in
@@ -103,6 +100,18 @@ final class MenuBarController: NSObject {
 
         statusItem.menu = menu
     }
+
+    // =========================================================
+    // Dictionary update
+    // =========================================================
+
+    @objc private func updateDictionary() {
+        AppManager.shared.updateDictionary()
+    }
+
+    // =========================================================
+    // Actions
+    // =========================================================
 
     @objc private func startRecording() {
         AppManager.shared.startRecordingFromMenu()
