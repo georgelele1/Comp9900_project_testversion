@@ -19,10 +19,10 @@ final class FloatingIndicator {
             window.isOpaque = false
             window.backgroundColor = .clear
             window.hasShadow = true
-            window.collectionBehavior = [.canJoinAllSpaces, .transient]
+            window.collectionBehavior = [.canJoinAllSpaces, .moveToActiveSpace]
 
-            let (_, mode) = AppManager.shared.activeAppDetector.getActiveAppAndMode()
-            let view = IndicatorView(mode: mode)
+            let appName = AppManager.shared.activeAppDetector.getActiveAppName()
+            let view = IndicatorView(appName: appName)
             window.contentView = NSHostingView(rootView: view)
 
             let mouseLocation = NSEvent.mouseLocation
@@ -46,7 +46,7 @@ final class FloatingIndicator {
 }
 
 struct IndicatorView: View {
-    let mode: TranscriptionMode
+    let appName: String
 
     var body: some View {
         ZStack {
@@ -62,7 +62,7 @@ struct IndicatorView: View {
                         .font(.system(size: 14, weight: .semibold))
                 }
 
-                Text(mode.rawValue.capitalized)
+                Text(appName)
                     .foregroundColor(.gray)
                     .font(.system(size: 11))
             }
