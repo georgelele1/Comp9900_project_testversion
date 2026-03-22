@@ -15,7 +15,6 @@ final class AppManager: ObservableObject {
     @Published var appStatus: AppStatus = .idle
     @Published var lastOutputText: String = ""
     @Published var currentActiveApp: String = "Unknown"
-    @Published var currentTranscriptionMode: TranscriptionMode = .generic
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -47,11 +46,35 @@ final class AppManager: ObservableObject {
             .store(in: &cancellables)
     }
 
-    func detectCurrentAppAndMode() {
-        let (appName, mode) = activeAppDetector.getActiveAppAndMode()
+    func updateDictionary() {
+        guard localBackendClient.isBackendAvailable else {
+            showErrorAlert(message: "Python backend is not accessible")
+            return
+        }
+        updateAppStatus(.processing)
+        localBackendClient.runDictionaryUpdate { [weak self] result in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let message):
+                    self.updateAppStatus(.idle)
+                    let alert = NSAlert()
+                    alert.messageText = "Dictionary Updated"
+                    alert.informativeText = message
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                case .failure(let error):
+                    self.updateAppStatus(.error)
+                    self.showErrorAlert(message: "Dictionary update failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func detectCurrentApp() {
+        let appName = activeAppDetector.getActiveAppName()
         DispatchQueue.main.async {
             self.currentActiveApp = appName
-            self.currentTranscriptionMode = mode
         }
     }
 
@@ -63,7 +86,7 @@ final class AppManager: ObservableObject {
     }
 
     func startRecordingFromMenu() {
-        detectCurrentAppAndMode()
+        detectCurrentApp()
         startRecording()
     }
 
@@ -101,8 +124,7 @@ final class AppManager: ObservableObject {
 
         localBackendClient.transcribeAudio(
             fileURL: audioFileURL,
-            appName: currentActiveApp,
-            mode: currentTranscriptionMode
+            appName: currentActiveApp
         ) { [weak self] result in
             guard let self else { return }
 
