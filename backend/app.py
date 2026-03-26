@@ -167,7 +167,7 @@ def ai_refine_text(text: str, app_name: str = "") -> str:
         return text
 
     app_hint = f"The user is currently using {app_name.strip()}." if app_name.strip() else ""
-
+    
     agent = Agent(
         model="gpt-5",
         name="whispr_text_refiner",
@@ -215,8 +215,8 @@ def transcribe_and_enhance_impl(
             "ts": now_ms(),
         }
 
-    raw = transcribe(audio_path)
-    raw_text = str(raw).strip()
+    # Transcribe audio to text
+    raw_text = transcribe_audio(audio_path)
 
     try:
         final_text = apply_dictionary_corrections(
