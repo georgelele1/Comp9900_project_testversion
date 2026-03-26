@@ -25,16 +25,6 @@ struct DictionaryUpdateResult {
 final class LocalBackendClient: ObservableObject {
     @Published var isBackendAvailable = false
 
-    private let pythonCandidates = [
-        "/Users/yanbowang/opt/anaconda3/bin/python3.11",
-        "/Users/yanbowang/opt/anaconda3/bin/python3",
-        "/opt/homebrew/bin/python3.11",
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3.11",
-        "/usr/local/bin/python3",
-        "/usr/bin/python3"
-    ]
-
     private let timeout: TimeInterval = 300
 
     private var pythonPath: String?
@@ -47,7 +37,7 @@ final class LocalBackendClient: ObservableObject {
     private func checkBackendAvailability() {
         let fm = FileManager.default
 
-        pythonPath = pythonCandidates.first(where: { fm.fileExists(atPath: $0) })
+        pythonPath = Config.pythonCandidates.first(where: { fm.fileExists(atPath: $0) })
 
         if let root = findProjectRoot() {
             let candidate = root.appendingPathComponent("backend/app.py").path
@@ -66,6 +56,7 @@ final class LocalBackendClient: ObservableObject {
         let fm = FileManager.default
         var current = URL(fileURLWithPath: fm.currentDirectoryPath)
 
+        // First try walking up from the current directory
         for _ in 0..<8 {
             let backendCandidate = current.appendingPathComponent("backend/app.py").path
             if fm.fileExists(atPath: backendCandidate) {
@@ -74,13 +65,10 @@ final class LocalBackendClient: ObservableObject {
             current.deleteLastPathComponent()
         }
 
-        let fallback = URL(fileURLWithPath: "/Users/quinta/Desktop/snippet实现和测试报告/Comp9900_project_testversion-main")
-        let fallbackBackend = fallback.appendingPathComponent("backend/app.py").path
-        if fm.fileExists(atPath: fallbackBackend) {
-            return fallback
-        }
-
-        return nil
+        // Then try each teammate's known path from Config
+        return Config.fallbackRoots
+            .map { URL(fileURLWithPath: $0) }
+            .first { fm.fileExists(atPath: $0.appendingPathComponent("backend/app.py").path) }
     }
 
     func runDictionaryUpdate(completion: @escaping (Result<DictionaryUpdateResult, Error>) -> Void) {
