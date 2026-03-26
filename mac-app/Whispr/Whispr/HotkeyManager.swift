@@ -8,10 +8,10 @@ final class HotkeyManager {
     private var runLoopSource: CFRunLoopSource?
     private var hotkeyHandler: ((Bool) -> Void)?
     
-    // Start: Cmd + Shift + Space
+    // Start: option + Space
     private let startHotkey = KeyCombo(keyCode: 49, modifiers: [.option])
     
-    // Stop: Cmd + Shift + S
+    // Stop: option + S
     private let stopHotkey = KeyCombo(keyCode: 1, modifiers: [.option])
 
     // Only compare these modifier bits, ignore device-dependent raw bits
