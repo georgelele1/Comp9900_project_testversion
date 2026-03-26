@@ -2,7 +2,8 @@
 Snippets module for Whispr.
 
 Manages voice shortcuts that expand to full text.
-e.g. user says "my schedule link" -> pastes full Calendly URL
+e.g. user says "give me my calendar link" -> pastes full Calendly URL
+e.g. user says "what's my schedule for tomorrow" -> fetches Google Calendar events
 
 Storage: ~/Library/Application Support/Whispr/snippets.json
 CLI:
@@ -21,8 +22,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+from connectonion import Agent
+
 APP_NAME = "Whispr"
 SNIPPETS_FILE = "snippets.json"
+
+# Triggers that are handled dynamically (not static expansions)
+DYNAMIC_TRIGGERS = {"calendar"}
 
 
 # =========================================================
@@ -138,40 +144,97 @@ def toggle_snippet(trigger: str, enabled: bool = True) -> Dict[str, Any]:
 
 
 # =========================================================
+# Agent-based intent detection (single call for all triggers)
+# =========================================================
+
+def should_expand_snippets(text: str, triggers: List[str]) -> List[str]:
+    """Ask the agent once which triggers, if any, are being requested."""
+    agent = Agent(
+        model="gpt-5",
+        name="whispr_snippet_detector",
+        system_prompt=(
+            "You are a snippet intent detector for a voice transcription app. "
+            "Given transcribed speech and a list of snippet triggers, "
+            "return ONLY a JSON array of triggers the user is requesting to expand or insert. "
+            "Only include a trigger if the user clearly intends to use that snippet. "
+            "Return an empty array [] if none apply. "
+            "No explanation, no markdown, just the raw JSON array."
+        )
+    )
+
+    result = agent.input(
+        f"Transcribed text: {text}\n"
+        f"Available triggers: {json.dumps(triggers)}\n"
+        f"Which triggers is the user requesting? Reply with JSON array only."
+    )
+
+    try:
+        matched = json.loads(str(result).strip())
+        return matched if isinstance(matched, list) else []
+    except Exception:
+        return []
+
+
+# =========================================================
+# Dynamic trigger handlers
+# =========================================================
+
+def handle_dynamic_trigger(trigger: str, text: str) -> str:
+    """Handle triggers that require dynamic data rather than static expansion."""
+    trigger_lower = trigger.lower()
+
+    if trigger_lower == "calendar":
+        try:
+            from gcalendar import get_schedule, extract_date_from_text
+            date = extract_date_from_text(text)
+            return get_schedule(date=date)
+        except Exception as e:
+            return f"Could not fetch calendar: {str(e)}"
+
+    return text
+
+
+# =========================================================
 # Expansion logic
 # =========================================================
 
 def apply_snippets(text: str) -> str:
-    """Expand all matching snippet triggers in the text.
+    """Expand snippet triggers in the text using agent-based intent detection.
 
-    Scans for each enabled trigger and replaces it with the
-    expansion text. Matching is case-insensitive and uses word
-    boundaries so partial matches inside longer words don't fire.
+    Makes a single agent call to detect which triggers, if any, the user
+    is requesting. Dynamic triggers (like calendar) fetch live data.
+    Static triggers expand to their stored text.
     """
     if not text or not text.strip():
         return text
 
     data = load_snippets()
+
+    # Build a map of trigger -> expansion for enabled snippets only
+    snippets = {
+        item["trigger"]: item["expansion"]
+        for item in data.get("snippets", [])
+        if item.get("enabled", True)
+        and str(item.get("trigger", "")).strip()
+        and str(item.get("expansion", "")).strip()
+    }
+
+    if not snippets:
+        return text
+
+    # Single agent call to detect all intended triggers at once
+    matched_triggers = should_expand_snippets(text, list(snippets.keys()))
+
     result = text
-
-    for item in data.get("snippets", []):
-        if not item.get("enabled", True):
-            continue
-
-        trigger = str(item.get("trigger", "")).strip()
-        expansion = str(item.get("expansion", "")).strip()
-        if not trigger or not expansion:
-            continue
-
-        # triggers starting with "/" are literal prefix matches
-        # other triggers use word boundary matching
-        if trigger.startswith("/"):
-            # literal replacement (case-insensitive)
-            pattern = re.escape(trigger)
-        else:
-            pattern = rf"\b{re.escape(trigger)}\b"
-
-        result = re.sub(pattern, expansion, result, flags=re.IGNORECASE)
+    for trigger in matched_triggers:
+        if trigger in snippets:
+            # Dynamic triggers fetch live data
+            if trigger.lower() in DYNAMIC_TRIGGERS:
+                result = handle_dynamic_trigger(trigger, text)
+            else:
+                # Static expansion
+                result = snippets[trigger]
+            break
 
     return result
 
