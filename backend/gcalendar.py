@@ -77,15 +77,6 @@ def extract_date_from_text(text: str) -> str:
 # =========================================================
 
 def get_schedule(date: str = "today", timezone: str = "Australia/Sydney") -> str:
-    """Fetch Google Calendar events for a given date.
-
-    Args:
-        date: 'today', 'tomorrow', or a YYYY-MM-DD string.
-        timezone: IANA timezone string.
-
-    Returns:
-        A formatted string of events, or a message if none found.
-    """
     try:
         creds = get_credentials()
         service = build("calendar", "v3", credentials=creds)
@@ -98,7 +89,6 @@ def get_schedule(date: str = "today", timezone: str = "Australia/Sydney") -> str
         elif date == "tomorrow":
             target = now + timedelta(days=1)
         else:
-            # Try parsing YYYY-MM-DD
             try:
                 parsed = datetime.strptime(date, "%Y-%m-%d")
                 target = tz.localize(parsed)
@@ -108,39 +98,50 @@ def get_schedule(date: str = "today", timezone: str = "Australia/Sydney") -> str
         start = target.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         end   = target.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
 
-        events_result = service.events().list(
-            calendarId="primary",
-            timeMin=start,
-            timeMax=end,
-            singleEvents=True,
-            orderBy="startTime",
-        ).execute()
+        # Get all calendars
+        calendars = service.calendarList().list().execute().get("items", [])
 
-        events = events_result.get("items", [])
+        all_events = []
+        for cal in calendars:
+            cal_id = cal["id"]
+            cal_name = cal.get("summary", cal_id)
 
-        if not events:
-            date_label = date if date not in ("today", "tomorrow") else date
-            return f"No events found for {date_label}."
+            events = service.events().list(
+                calendarId=cal_id,
+                timeMin=start,
+                timeMax=end,
+                singleEvents=True,
+                orderBy="startTime",
+            ).execute().get("items", [])
+
+            for event in events:
+                event["_calendar_name"] = cal_name  # tag which calendar it came from
+                all_events.append(event)
+
+        # Sort all events by start time
+        all_events.sort(key=lambda e: e["start"].get("dateTime", e["start"].get("date", "")))
+
+        if not all_events:
+            return f"No events found for {date}."
 
         lines = [f"Schedule for {date}:"]
-        for event in events:
+        for event in all_events:
             start_raw = event["start"].get("dateTime", event["start"].get("date", ""))
             summary = event.get("summary", "Untitled event")
+            cal_name = event.get("_calendar_name", "")
 
-            # Format time nicely if it's a datetime
             try:
                 dt = datetime.fromisoformat(start_raw)
                 time_str = dt.strftime("%I:%M %p")
             except Exception:
                 time_str = start_raw
 
-            lines.append(f"  - {time_str}: {summary}")
+            lines.append(f"  - {time_str}: {summary} [{cal_name}]")
 
         return "\n".join(lines)
 
     except Exception as e:
         return f"Could not fetch calendar: {str(e)}"
-
 
 # =========================================================
 # CLI test
