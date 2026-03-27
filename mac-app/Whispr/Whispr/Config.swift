@@ -7,6 +7,7 @@ enum Config {
         "/Users/quinta/Desktop/snippet实现和测试报告/Comp9900_project_testversion-main",
         "/Users/georgelele/OneDrive/桌面/9900/Comp9900_project_testversion",
         "/Users/yanbowang/Comp9900_project_testversion",
+        "/Users/austinmac/Desktop/9900/new/Comp9900_project_testversion"
         // add your path below this line
     ]
 
@@ -18,6 +19,7 @@ enum Config {
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3.11",
         "/usr/local/bin/python3",
-        "/usr/bin/python3"
+        "/usr/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"
     ]
 }
