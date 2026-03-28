@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Combine
 
 final class MenuBarController: NSObject {
@@ -6,6 +7,7 @@ final class MenuBarController: NSObject {
 
     private let statusItem: NSStatusItem
     private var cancellables = Set<AnyCancellable>()
+    private var settingsWindow: NSWindow?
 
     private override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -72,14 +74,10 @@ final class MenuBarController: NSObject {
             .receive(on: DispatchQueue.main)
             .sink { status in
                 switch status {
-                case .idle:
-                    statusItemMenu.title = "Status: Idle"
-                case .listening:
-                    statusItemMenu.title = "Status: Recording"
-                case .processing:
-                    statusItemMenu.title = "Status: Processing"
-                case .error:
-                    statusItemMenu.title = "Status: Error"
+                case .idle:       statusItemMenu.title = "Status: Idle"
+                case .listening:  statusItemMenu.title = "Status: Recording"
+                case .processing: statusItemMenu.title = "Status: Processing"
+                case .error:      statusItemMenu.title = "Status: Error"
                 }
             }
             .store(in: &cancellables)
@@ -94,7 +92,9 @@ final class MenuBarController: NSObject {
         AppManager.shared.$lastOutputText
             .receive(on: DispatchQueue.main)
             .sink { text in
-                lastResultItem.title = text.isEmpty ? "Last Result: No transcription yet" : "Last Result: \(text)"
+                lastResultItem.title = text.isEmpty
+                    ? "Last Result: No transcription yet"
+                    : "Last Result: \(text)"
             }
             .store(in: &cancellables)
 
@@ -122,7 +122,32 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func openSettings() {
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        // Reuse existing window if already open
+        if let existing = settingsWindow, existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        // Build the SwiftUI settings view and host it in an NSWindow
+        let backendClient = AppManager.shared.backendClient
+        let settingsView  = SettingsView(backendClient: backendClient)
+        let hostingView   = NSHostingView(rootView: settingsView)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 360),
+            styleMask:   [.titled, .closable],
+            backing:     .buffered,
+            defer:       false
+        )
+        window.title           = "Whispr Settings"
+        window.contentView     = hostingView
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        settingsWindow = window
     }
 
     @objc private func quitApp() {
