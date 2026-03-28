@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 from connectonion.address import load
 from connectonion import Agent, host, transcribe
@@ -18,6 +18,14 @@ APP_NAME = "Whispr"
 PROFILE_FILE = "profile.json"
 DICTIONARY_FILE = "dictionary.json"
 HISTORY_FILE = "history.json"
+
+# Self-correction settings
+SCORE_THRESHOLD = 70
+MAX_RETRIES = 3
+
+# Dictionary auto-update settings
+DICTIONARY_UPDATE_INTERVAL = 60 * 60 * 24  # 24 hours in seconds
+
 
 # =========================================================
 # Paths / storage
@@ -62,6 +70,7 @@ def load_store(filename: str, default: Any) -> Any:
 
 def save_store(filename: str, data: Any) -> None:
     write_json(storage_path(filename), data)
+
 
 # =========================================================
 # Defaults
@@ -108,6 +117,7 @@ def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
     data["items"] = items[-max_items:]
     save_store(HISTORY_FILE, data)
 
+
 # =========================================================
 # Common helpers
 # =========================================================
@@ -134,6 +144,7 @@ def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
 
     raise RuntimeError("Cannot register tool: unknown connectonion tool API in this install.")
 
+
 # =========================================================
 # Dictionary corrections
 # =========================================================
@@ -157,6 +168,99 @@ def apply_dictionary_corrections(text: str) -> str:
                 result = re.sub(rf"\b{re.escape(alias)}\b", phrase, result, flags=re.IGNORECASE)
 
     return result
+
+
+# =========================================================
+# Dictionary auto-update helpers
+# =========================================================
+
+def should_update_dictionary() -> bool:
+    """Returns True if enough time has passed since last dictionary update."""
+    path = storage_path("dictionary_last_update.json")
+    if not path.exists():
+        return True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        last = data.get("last_update", 0)
+        return (time.time() - last) > DICTIONARY_UPDATE_INTERVAL
+    except Exception:
+        return True
+
+
+def mark_dictionary_updated() -> None:
+    """Save current timestamp as last dictionary update time."""
+    path = storage_path("dictionary_last_update.json")
+    path.write_text(
+        json.dumps({"last_update": time.time()}),
+        encoding="utf-8"
+    )
+
+
+def get_new_history_since_last_update() -> List[Dict[str, Any]]:
+    """Return only history items added since the last dictionary update."""
+    path = storage_path("dictionary_last_update.json")
+
+    last_update_ts = 0
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            last_update_ts = data.get("last_update", 0)
+        except Exception:
+            pass
+
+    history = load_history()
+    items = history.get("items", [])
+
+    # ts is stored in ms, last_update_ts is in seconds
+    new_items = [
+        item for item in items
+        if item.get("ts", 0) / 1000 > last_update_ts
+    ]
+
+    return new_items
+
+
+def get_optimal_sample_size(items: List[Any]) -> int:
+    """Dynamically decide how many new items to sample to minimise token usage."""
+    total = len(items)
+
+    if total == 0:
+        return 0
+    elif total < 20:
+        return total                    # use all if small
+    elif total < 100:
+        return max(20, total // 3)      # 33% sample
+    else:
+        return max(40, total // 5)      # 20% sample
+
+
+def deduplicate_items(texts: List[str], threshold: int = 10) -> List[str]:
+    """Remove near-duplicate texts using a word fingerprint to save tokens."""
+    seen = set()
+    unique = []
+
+    for text in texts:
+        fingerprint = " ".join(text.lower().split()[:threshold])
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            unique.append(text)
+
+    return unique
+
+
+def prepare_items_for_agent(items: List[Dict[str, Any]]) -> List[str]:
+    """Strip unnecessary fields and deduplicate before sending to agent.
+
+    Only sends final_text — skips raw_text, audio_path, ts, app_name
+    to minimise token usage by ~60%.
+    """
+    texts = [
+        str(item.get("final_text", "")).strip()
+        for item in items
+        if str(item.get("final_text", "")).strip()
+    ]
+    return deduplicate_items(texts)
+
 
 # =========================================================
 # AI refine
@@ -198,6 +302,82 @@ Output only the final refined text.
 
     return clean_agent_output(agent.input(instruction))
 
+
+# =========================================================
+# Self-correction
+# =========================================================
+
+def self_correct_text(
+    raw_text: str,
+    initial_refined: str,
+    app_name: str = "",
+) -> str:
+    """Evaluate refined text and retry with eval feedback if score is too low.
+
+    Uses the eval runner to score the refinement. If below SCORE_THRESHOLD,
+    feeds the reason back into a correction agent and retries up to MAX_RETRIES.
+    Always returns the best scoring attempt.
+    """
+    try:
+        from Eval_run import run_refinement_eval, score_evaluation
+    except ImportError:
+        # Eval runner not available — return as-is
+        return initial_refined
+
+    current = initial_refined
+    best_text = initial_refined
+    best_score = 0
+
+    for attempt in range(MAX_RETRIES):
+        results = run_refinement_eval([{
+            "raw_text": raw_text,
+            "final_text": current,
+            "app_name": app_name,
+        }], verbose=False)
+
+        if not results:
+            break
+
+        passed = results[0]["passed"]
+        score = results[0]["score"]
+        reason = results[0]["reason"]
+
+        # Track best attempt
+        if score > best_score:
+            best_score = score
+            best_text = current
+
+        print(f"[self-correct] attempt {attempt + 1} score={score}/100", file=sys.stderr)
+
+        # Pass threshold — done
+        if score >= SCORE_THRESHOLD:
+            break
+
+        # Fail — retry with reason fed back into corrector agent
+        print(f"[self-correct] score below {SCORE_THRESHOLD}, retrying...", file=sys.stderr)
+
+        agent = Agent(
+            model="gpt-5",
+            name="whispr_self_corrector",
+            system_prompt=(
+                "You are Whispr's self-correction agent. "
+                "You will receive a previous refinement attempt and the reason it failed evaluation. "
+                "Fix only the issues identified and output ONLY the corrected text. "
+                "Do NOT add new facts or change the core meaning."
+            )
+        )
+
+        current = clean_agent_output(agent.input(
+            f"App context: {app_name or 'unknown'}\n\n"
+            f"Original raw text:\n{raw_text}\n\n"
+            f"Previous refinement attempt:\n{current}\n\n"
+            f"Evaluation feedback:\n{reason}\n\n"
+            f"Output only the corrected text."
+        ))
+
+    return best_text
+
+
 # =========================================================
 # Transcribe helper
 # =========================================================
@@ -205,6 +385,7 @@ Output only the final refined text.
 def transcribe_audio(audio_path: str) -> str:
     """Transcribe an audio file to text."""
     return str(transcribe(audio_path)).strip()
+
 
 # =========================================================
 # Core
@@ -226,11 +407,19 @@ def transcribe_and_enhance_impl(
     raw_text = transcribe_audio(audio_path)
 
     try:
-        refined_text = apply_dictionary_corrections(
-            ai_refine_text(text=raw_text, app_name=app_name)
-        )
+        # Step 1: AI refine
+        initial_refined = ai_refine_text(text=raw_text, app_name=app_name)
+
+        # Step 2: Self-correct based on eval score
+        corrected_text = self_correct_text(raw_text, initial_refined, app_name)
+
+        # Step 3: Apply dictionary corrections
+        refined_text = apply_dictionary_corrections(corrected_text)
+
+        # Step 4: Apply snippets
         from snippets import apply_snippets
         final_text = apply_snippets(refined_text)
+
     except Exception:
         final_text = apply_dictionary_corrections(raw_text)
 
@@ -248,6 +437,7 @@ def transcribe_and_enhance_impl(
         "final_text": final_text,
         "ts": now_ms(),
     }
+
 
 # =========================================================
 # Tool functions
@@ -287,6 +477,7 @@ def transcribe_and_enhance(
         app_name=app_name,
     )
 
+
 # =========================================================
 # Agent factory
 # =========================================================
@@ -309,6 +500,7 @@ def create_agent() -> Agent:
 
     return agent
 
+
 # =========================================================
 # CLI / host
 # =========================================================
@@ -319,29 +511,73 @@ if __name__ == "__main__":
             print(json.dumps({"output": ""}, ensure_ascii=False))
             sys.exit(1)
 
-        audio_path = sys.argv[2]
-        app_name = sys.argv[3] if len(sys.argv) > 3 else ""
+        command = sys.argv[2]
 
-        print(f"PYTHON RECEIVED PATH: {audio_path}", file=sys.stderr)
-        print(f"FILE EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
+        # ── transcribe command ──
+        if command == "transcribe":
+            audio_path = sys.argv[3] if len(sys.argv) > 3 else ""
+            app_name   = sys.argv[4] if len(sys.argv) > 4 else ""
 
-        try:
-            result = transcribe_and_enhance_impl(
-                audio_path=audio_path,
-                app_name=app_name,
-            )
+            print(f"PYTHON RECEIVED PATH: {audio_path}", file=sys.stderr)
+            print(f"FILE EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
 
-            print(json.dumps({
-                "output": result.get("final_text", "")
-            }, ensure_ascii=False))
-            sys.exit(0)
+            try:
+                result = transcribe_and_enhance_impl(
+                    audio_path=audio_path,
+                    app_name=app_name,
+                )
+                print(json.dumps({
+                    "output": result.get("final_text", "")
+                }, ensure_ascii=False))
+                sys.exit(0)
 
-        except Exception as e:
-            print(json.dumps({
-                "output": ""
-            }, ensure_ascii=False))
-            print(f"ERROR: {str(e)}", file=sys.stderr)
-            sys.exit(1)
+            except Exception as e:
+                print(json.dumps({"output": ""}))
+                print(f"ERROR: {str(e)}", file=sys.stderr)
+                sys.exit(1)
+
+        # ── calendar command ──
+        elif command == "calendar":
+            text    = sys.argv[3] if len(sys.argv) > 3 else "today"
+            user_id = sys.argv[4] if len(sys.argv) > 4 else None
+
+            try:
+                from gcalendar import get_schedule, extract_date_from_text
+                from auth import get_credentials
+                import getpass
+                uid = user_id or getpass.getuser()
+                date = extract_date_from_text(text)
+                schedule = get_schedule(date=date, user_id=uid)
+                print(json.dumps({"output": schedule}, ensure_ascii=False))
+                sys.exit(0)
+
+            except Exception as e:
+                print(json.dumps({"output": ""}))
+                print(f"ERROR: {str(e)}", file=sys.stderr)
+                sys.exit(1)
+
+        # ── legacy: direct audio path as argv[2] (backwards compat) ──
+        else:
+            audio_path = sys.argv[2]
+            app_name   = sys.argv[3] if len(sys.argv) > 3 else ""
+
+            print(f"PYTHON RECEIVED PATH: {audio_path}", file=sys.stderr)
+            print(f"FILE EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
+
+            try:
+                result = transcribe_and_enhance_impl(
+                    audio_path=audio_path,
+                    app_name=app_name,
+                )
+                print(json.dumps({
+                    "output": result.get("final_text", "")
+                }, ensure_ascii=False))
+                sys.exit(0)
+
+            except Exception as e:
+                print(json.dumps({"output": ""}))
+                print(f"ERROR: {str(e)}", file=sys.stderr)
+                sys.exit(1)
 
     else:
         addr = load(CO_DIR)
