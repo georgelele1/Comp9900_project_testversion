@@ -32,7 +32,27 @@ final class LocalBackendClient: ObservableObject {
 
     init() {
         checkBackendAvailability()
+
+        // Auto-update dictionary on launch in background
+        if isBackendAvailable {
+            DispatchQueue.global(qos: .background).async {
+                self.runDictionaryUpdate { result in
+                    switch result {
+                    case .success(let update):
+                        if update.totalTerms > 0 {
+                            print("Dictionary updated: \(update.added.count) added, \(update.updated.count) updated, \(update.totalTerms) total")
+                        }
+                    case .failure(let error):
+                        print("Dictionary update skipped or failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
     }
+
+    // =========================================================
+    // Backend availability
+    // =========================================================
 
     private func checkBackendAvailability() {
         let fm = FileManager.default
@@ -56,7 +76,7 @@ final class LocalBackendClient: ObservableObject {
         let fm = FileManager.default
         var current = URL(fileURLWithPath: fm.currentDirectoryPath)
 
-        // First try walking up from the current directory
+        // Walk up from current directory first
         for _ in 0..<8 {
             let backendCandidate = current.appendingPathComponent("backend/app.py").path
             if fm.fileExists(atPath: backendCandidate) {
@@ -65,17 +85,75 @@ final class LocalBackendClient: ObservableObject {
             current.deleteLastPathComponent()
         }
 
-        // Then try each teammate's known path from Config
+        // Fall back to each teammate's known path from Config
         return Config.fallbackRoots
             .map { URL(fileURLWithPath: $0) }
             .first { fm.fileExists(atPath: $0.appendingPathComponent("backend/app.py").path) }
     }
 
-    func runDictionaryUpdate(completion: @escaping (Result<DictionaryUpdateResult, Error>) -> Void) {
-        guard let pythonPath, let backendScriptPath else {
+    // =========================================================
+    // Run a generic Python CLI command and return raw output
+    // =========================================================
+
+    private func runPythonCommand(
+        script: String,
+        arguments: [String],
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        guard let pythonPath else {
             completion(.failure(NSError(
                 domain: "LocalBackendClient", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Python or backend script not found"]
+                userInfo: [NSLocalizedDescriptionKey: "Python not found"]
+            )))
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.currentDirectoryURL = URL(fileURLWithPath: script).deletingLastPathComponent()
+            process.executableURL = URL(fileURLWithPath: pythonPath)
+            process.arguments = [script] + arguments
+
+            let outputPipe = Pipe()
+            let errorPipe  = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError  = errorPipe
+
+            do {
+                try process.run()
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+
+            process.waitUntilExit()
+
+            let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let stderr = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+            DispatchQueue.main.async {
+                if process.terminationStatus == 0 {
+                    completion(.success(output))
+                } else {
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient",
+                        code: Int(process.terminationStatus),
+                        userInfo: [NSLocalizedDescriptionKey: stderr.isEmpty ? "Command failed" : stderr]
+                    )))
+                }
+            }
+        }
+    }
+
+    // =========================================================
+    // Dictionary update
+    // =========================================================
+
+    func runDictionaryUpdate(completion: @escaping (Result<DictionaryUpdateResult, Error>) -> Void) {
+        guard let backendScriptPath else {
+            completion(.failure(NSError(
+                domain: "LocalBackendClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Backend script not found"]
             )))
             return
         }
@@ -93,45 +171,12 @@ final class LocalBackendClient: ObservableObject {
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            process.currentDirectoryURL = URL(fileURLWithPath: backendScriptPath).deletingLastPathComponent()
-            process.executableURL = URL(fileURLWithPath: pythonPath)
-            process.arguments = [dictionaryScriptPath, "cli", "update"]
-
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
-
-            do {
-                print("Running dictionary update...")
-                try process.run()
-            } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
-                return
-            }
-
-            process.waitUntilExit()
-
-            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let outputString = String(data: outputData, encoding: .utf8) ?? ""
-            let errorString = String(data: errorData, encoding: .utf8) ?? ""
-
-            print("Dictionary STDOUT:", outputString)
-            print("Dictionary STDERR:", errorString)
-
-            DispatchQueue.main.async {
-                guard process.terminationStatus == 0 else {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient", code: Int(process.terminationStatus),
-                        userInfo: [NSLocalizedDescriptionKey: errorString.isEmpty ? "Dictionary update failed" : errorString]
-                    )))
-                    return
-                }
-
-                let trimmed = outputString.trimmingCharacters(in: .whitespacesAndNewlines)
+        runPythonCommand(script: dictionaryScriptPath, arguments: ["cli", "update"]) { result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let output):
+                let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard let jsonLine = trimmed
                     .components(separatedBy: .newlines)
                     .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
@@ -143,13 +188,17 @@ final class LocalBackendClient: ObservableObject {
                     return
                 }
 
-                let added = (json["added"] as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
+                let added   = (json["added"]   as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
                 let updated = (json["updated"] as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
-                let total = json["total_terms"] as? Int ?? 0
+                let total   = json["total_terms"] as? Int ?? 0
                 completion(.success(DictionaryUpdateResult(added: added, updated: updated, totalTerms: total)))
             }
         }
     }
+
+    // =========================================================
+    // Transcription
+    // =========================================================
 
     func transcribeAudio(
         fileURL: URL,
@@ -157,15 +206,14 @@ final class LocalBackendClient: ObservableObject {
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         guard let pythonPath, let backendScriptPath else {
-            completion(.failure(
-                NSError(
-                    domain: "LocalBackendClient",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Python or backend script not found"]
-                )
-            ))
+            completion(.failure(NSError(
+                domain: "LocalBackendClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Python or backend script not found"]
+            )))
             return
         }
+
+        let targetLanguage = Config.targetLanguage
 
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
@@ -174,14 +222,16 @@ final class LocalBackendClient: ObservableObject {
             process.arguments = [
                 backendScriptPath,
                 "cli",
+                "transcribe",
                 fileURL.path,
-                appName
+                appName.isEmpty ? "unknown" : appName,
+                targetLanguage                          // ← language passed to Python
             ]
 
             let outputPipe = Pipe()
-            let errorPipe = Pipe()
+            let errorPipe  = Pipe()
             process.standardOutput = outputPipe
-            process.standardError = errorPipe
+            process.standardError  = errorPipe
 
             do {
                 print("file exists before run =", FileManager.default.fileExists(atPath: fileURL.path))
@@ -190,19 +240,17 @@ final class LocalBackendClient: ObservableObject {
                 print("script =", backendScriptPath)
                 print("audio =", fileURL.path)
                 print("app name =", appName)
+                print("target language =", targetLanguage)
                 print("args =", process.arguments ?? [])
                 print("cwd =", process.currentDirectoryURL?.path ?? "nil")
                 try process.run()
             } catch {
-                DispatchQueue.main.async {
-                    completion(.failure(error))
-                }
+                DispatchQueue.main.async { completion(.failure(error)) }
                 return
             }
 
             let group = DispatchGroup()
             group.enter()
-
             DispatchQueue.global(qos: .userInitiated).async {
                 process.waitUntilExit()
                 group.leave()
@@ -212,22 +260,16 @@ final class LocalBackendClient: ObservableObject {
             if waitResult == .timedOut {
                 process.terminate()
                 DispatchQueue.main.async {
-                    completion(.failure(
-                        NSError(
-                            domain: "LocalBackendClient",
-                            code: -2,
-                            userInfo: [NSLocalizedDescriptionKey: "Transcription timed out"]
-                        )
-                    ))
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient", code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "Transcription timed out"]
+                    )))
                 }
                 return
             }
 
-            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-
-            let outputString = String(data: outputData, encoding: .utf8) ?? ""
-            let errorString = String(data: errorData, encoding: .utf8) ?? ""
+            let outputString = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let errorString  = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 
             print("STDOUT:", outputString)
             print("STDERR:", errorString)
@@ -237,13 +279,10 @@ final class LocalBackendClient: ObservableObject {
                 let trimmed = outputString.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 guard !trimmed.isEmpty else {
-                    completion(.failure(
-                        NSError(
-                            domain: "LocalBackendClient",
-                            code: -4,
-                            userInfo: [NSLocalizedDescriptionKey: "No output from backend"]
-                        )
-                    ))
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient", code: -4,
+                        userInfo: [NSLocalizedDescriptionKey: "No output from backend"]
+                    )))
                     return
                 }
 
@@ -253,55 +292,91 @@ final class LocalBackendClient: ObservableObject {
                     .filter { !$0.isEmpty }
 
                 guard let jsonLine = lines.last(where: { $0.hasPrefix("{") && $0.hasSuffix("}") }) else {
-                    completion(.failure(
-                        NSError(
-                            domain: "LocalBackendClient",
-                            code: -6,
-                            userInfo: [NSLocalizedDescriptionKey: "No JSON line found in backend output: \(trimmed)"]
-                        )
-                    ))
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient", code: -6,
+                        userInfo: [NSLocalizedDescriptionKey: "No JSON in backend output: \(trimmed)"]
+                    )))
                     return
                 }
 
                 guard let data = jsonLine.data(using: .utf8) else {
-                    completion(.failure(
-                        NSError(
-                            domain: "LocalBackendClient",
-                            code: -7,
-                            userInfo: [NSLocalizedDescriptionKey: "Failed to encode backend JSON line"]
-                        )
-                    ))
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient", code: -7,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode JSON line"]
+                    )))
                     return
                 }
 
                 do {
                     let response = try JSONDecoder().decode(BackendResponse.self, from: data)
-
                     if process.terminationStatus == 0 {
                         completion(.success(response.output))
                     } else {
-                        completion(.failure(
-                            NSError(
-                                domain: "LocalBackendClient",
-                                code: Int(process.terminationStatus),
-                                userInfo: [
-                                    NSLocalizedDescriptionKey: errorString.isEmpty
-                                        ? "Backend exited with code \(process.terminationStatus)"
-                                        : errorString
-                                ]
-                            )
-                        ))
+                        completion(.failure(NSError(
+                            domain: "LocalBackendClient",
+                            code: Int(process.terminationStatus),
+                            userInfo: [NSLocalizedDescriptionKey: errorString.isEmpty
+                                ? "Backend exited with code \(process.terminationStatus)"
+                                : errorString]
+                        )))
                     }
                 } catch {
-                    completion(.failure(
-                        NSError(
-                            domain: "LocalBackendClient",
-                            code: -8,
-                            userInfo: [NSLocalizedDescriptionKey: "Invalid JSON line from backend: \(jsonLine)"]
-                        )
-                    ))
+                    completion(.failure(NSError(
+                        domain: "LocalBackendClient", code: -8,
+                        userInfo: [NSLocalizedDescriptionKey: "Invalid JSON: \(jsonLine)"]
+                    )))
                 }
             }
+        }
+    }
+
+    // =========================================================
+    // Language management
+    // =========================================================
+
+    /// Push the current Config.targetLanguage to the Python backend profile.
+    /// Call this after the user changes language in Settings.
+    func syncLanguageToBackend(completion: ((Bool) -> Void)? = nil) {
+        guard let backendScriptPath else {
+            completion?(false)
+            return
+        }
+
+        runPythonCommand(
+            script: backendScriptPath,
+            arguments: ["cli", "set-language", Config.targetLanguage]
+        ) { result in
+            switch result {
+            case .success:
+                print("Language synced to backend:", Config.targetLanguage)
+                completion?(true)
+            case .failure(let error):
+                print("Language sync failed:", error.localizedDescription)
+                completion?(false)
+            }
+        }
+    }
+
+    /// Fetch the language currently stored in the Python backend profile.
+    func fetchLanguageFromBackend(completion: @escaping (String?) -> Void) {
+        guard let backendScriptPath else {
+            completion(nil)
+            return
+        }
+
+        runPythonCommand(
+            script: backendScriptPath,
+            arguments: ["cli", "get-language"]
+        ) { result in
+            guard case .success(let output) = result,
+                  let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let lang = json["language"] as? String
+            else {
+                completion(nil)
+                return
+            }
+            completion(lang)
         }
     }
 }
