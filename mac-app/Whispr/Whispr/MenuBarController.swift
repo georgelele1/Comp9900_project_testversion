@@ -130,7 +130,7 @@ final class MenuBarController: NSObject {
         }
 
         // Build the SwiftUI settings view and host it in an NSWindow
-        let backendClient = AppManager.shared.backendClient
+        let backendClient = AppManager.shared.localBackendClient
         let settingsView  = SettingsView(backendClient: backendClient)
         let hostingView   = NSHostingView(rootView: settingsView)
 
