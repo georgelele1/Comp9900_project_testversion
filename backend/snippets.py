@@ -180,45 +180,60 @@ def build_snippet_agent(static_snippets: Dict[str, str]) -> Agent:
     """Build the snippet agent with static snippets in the prompt
     and dynamic tools registered.
 
-    Static snippets are passed directly in the system prompt so the
-    agent can return them without a tool call — zero extra latency.
-    Dynamic triggers (calendar etc.) are registered as tools so the
-    agent can call them with the right arguments extracted from the text,
-    replacing the old extract_calendar_intent round-trip.
+    Static snippets are baked into the system prompt — agent returns
+    them directly with no tool call (zero extra latency).
+
+    Dynamic triggers (calendar) are registered as tools. The agent MUST
+    only call get_calendar when the user explicitly mentions 'calendar'
+    or asks for their schedule — never for any other trigger.
     """
+    # Separate static from dynamic
+    static_map  = {t: e for t, e in static_snippets.items() if t.lower() not in DYNAMIC_TRIGGERS}
+    has_calendar = "calendar" in static_snippets
+
     static_lines = "\n".join(
-        f'  "{t}" → "{e}"'
-        for t, e in static_snippets.items()
-        if t.lower() not in DYNAMIC_TRIGGERS
+        f'  TRIGGER="{t}" → RETURN EXACTLY: {e}'
+        for t, e in static_map.items()
     )
 
-    dynamic_lines = "\n".join(
-        f'  "{t}" → call the {t} tool'
-        for t in DYNAMIC_TRIGGERS
-        if t in static_snippets
+    system_prompt = (
+        "You are Whispr's snippet expansion agent.\n"
+        "Given transcribed speech, check if it matches a snippet trigger.\n\n"
+    )
+
+    if static_lines:
+        system_prompt += (
+            "STATIC SNIPPETS — if the user's text matches, return ONLY the expansion text:\n"
+            f"{static_lines}\n\n"
+            "CRITICAL: For static snippets, NEVER call any tool. "
+            "Return the expansion text directly and immediately.\n\n"
+        )
+
+    if has_calendar:
+        system_prompt += (
+            "DYNAMIC SNIPPET — calendar:\n"
+            "  If the user asks for their schedule, calendar, or events: "
+            "call get_calendar(date, calendar_filter).\n"
+            "  ONLY call get_calendar for calendar/schedule requests. "
+            "NEVER call it for any other trigger.\n\n"
+        )
+
+    system_prompt += (
+        "RULES:\n"
+        "1. Static snippet match → return expansion text ONLY. No tool calls.\n"
+        "2. Calendar request → call get_calendar once with correct args.\n"
+        "3. No match → return the original text UNCHANGED.\n"
+        "4. Never add explanation or extra text. Output the result only."
     )
 
     agent = Agent(
         model="gpt-5",
         name="whispr_snippet_agent",
-        system_prompt=(
-            "You are Whispr's snippet expansion agent.\n"
-            "Given transcribed speech, decide if the user is requesting a snippet.\n\n"
-            + (f"Static snippets — return the expansion text directly:\n{static_lines}\n\n" if static_lines else "")
-            + (f"Dynamic snippets — use the registered tool:\n{dynamic_lines}\n\n" if dynamic_lines else "")
-            + "Rules:\n"
-            "- If a snippet is requested, return ONLY the expanded text.\n"
-            "- For dynamic snippets, call the appropriate tool with the correct "
-            "  arguments extracted from the user's text (e.g. date, calendar name).\n"
-            "- If NO snippet is requested, return the original text UNCHANGED.\n"
-            "- Never add explanation, preamble, or extra text."
-        ),
+        system_prompt=system_prompt,
     )
 
-    # Register get_calendar as a tool so the agent can call it directly
-    # with date and calendar_filter extracted from the transcribed text.
-    # This replaces the old two-step: detect intent → hardcoded if/else handler.
-    if "calendar" in static_snippets:
+    # Only register calendar tool if calendar snippet exists
+    if has_calendar:
         register_tool(agent, get_calendar)
 
     return agent
