@@ -191,28 +191,54 @@ def test_ai_refine() -> List[Dict[str, Any]]:
 
 
 def test_snippets() -> List[Dict[str, Any]]:
-    """Test snippet intent detection (agent call)."""
+    """Test snippet agent (single agent call with tools registered)."""
     print("\n── Snippets ────────────────────────────────────────")
-    from snippets import apply_snippets, should_expand_snippets
+    from snippets import apply_snippets, build_snippet_agent, get_calendar
+
+    # Mock snippet maps for isolated agent tests
+    static_only  = {"zoom link": "https://zoom.us/j/123456789", "my email": "test@example.com"}
+    with_calendar = {"calendar": "dynamic", "zoom link": "https://zoom.us/j/123456789"}
 
     results = []
+
+    # Test apply_snippets end-to-end with no match expected
     results.append(run_timed(
-        "snippets: apply_snippets (no match expected)",
+        "snippets: apply_snippets (no match)",
         apply_snippets,
         "Let me write an email about the project deadline",
     ))
+
+    # Test apply_snippets with a static trigger match
     results.append(run_timed(
-        "snippets: should_expand_snippets (empty triggers)",
-        should_expand_snippets,
-        MOCK_RAW_TEXT,
-        [],
+        "snippets: apply_snippets (static match)",
+        apply_snippets,
+        "give me my zoom link please",
     ))
+
+    # Test the agent build + single static expansion directly
     results.append(run_timed(
-        "snippets: should_expand_snippets (with triggers)",
-        should_expand_snippets,
-        "give me my calendar link please",
-        ["calendar", "email", "zoom link"],
+        "snippets: build_snippet_agent (static only)",
+        lambda: build_snippet_agent(static_only).input(
+            "can you paste my zoom link"
+        ),
     ))
+
+    # Test agent with calendar tool registered
+    results.append(run_timed(
+        "snippets: build_snippet_agent (with calendar tool)",
+        lambda: build_snippet_agent(with_calendar).input(
+            "give me my calendar link please"
+        ),
+    ))
+
+    # Test get_calendar tool function directly (without OAuth — expects error)
+    results.append(run_timed(
+        "snippets: get_calendar tool (no token — expects error)",
+        get_calendar,
+        "today",
+        "all",
+    ))
+
     return results
 
 
