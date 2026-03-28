@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from connectonion.address import load
 from connectonion import Agent, host, transcribe
@@ -32,6 +33,12 @@ SUPPORTED_LANGUAGES = [
     "Japanese", "Korean", "Arabic", "German", "Portuguese",
 ]
 DEFAULT_LANGUAGE = "English"
+
+# ── Intent types ─────────────────────────────────────────
+# "text"     → normal transcription, run full refine pipeline
+# "calendar" → user wants their schedule, skip refine
+# "snippet"  → user wants a static snippet, skip refine
+INTENT_TYPES = {"text", "calendar", "snippet"}
 
 
 # =========================================================
@@ -85,13 +92,8 @@ def save_store(filename: str, data: Any) -> None:
 
 def default_profile() -> Dict[str, Any]:
     return {
-        "name": "",
-        "email": "",
-        "organization": "",
-        "role": "",
-        "preferences": {
-            "target_language": DEFAULT_LANGUAGE,
-        },
+        "name": "", "email": "", "organization": "", "role": "",
+        "preferences": {"target_language": DEFAULT_LANGUAGE},
     }
 
 
@@ -128,14 +130,12 @@ def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
 
 
 def get_target_language() -> str:
-    """Read the user's preferred output language from their profile."""
     profile = load_profile()
     lang = profile.get("preferences", {}).get("target_language", DEFAULT_LANGUAGE)
     return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
 def set_target_language(language: str) -> bool:
-    """Save the user's preferred output language to their profile."""
     if language not in SUPPORTED_LANGUAGES:
         return False
     profile = load_profile()
@@ -159,7 +159,6 @@ def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
     if hasattr(agent, "add_tool") and callable(getattr(agent, "add_tool")):
         agent.add_tool(fn)
         return
-
     reg = getattr(agent, "tools", None)
     if reg is not None:
         for meth in ("register", "add", "add_tool", "add_function", "append"):
@@ -167,19 +166,16 @@ def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
             if callable(m):
                 m(fn)
                 return
-
     raise RuntimeError("Cannot register tool: unknown connectonion tool API.")
 
 
 # =========================================================
-# Dictionary corrections
+# Dictionary corrections  (pure regex — 0ms)
 # =========================================================
 
 def apply_dictionary_corrections(text: str) -> str:
-    """Apply approved dictionary aliases as regex replacements."""
     if not text.strip():
         return text
-
     result = text
     for item in load_dictionary().get("terms", []):
         if not item.get("approved", True):
@@ -191,10 +187,7 @@ def apply_dictionary_corrections(text: str) -> str:
             alias = str(alias).strip()
             if alias:
                 result = re.sub(
-                    rf"\b{re.escape(alias)}\b",
-                    phrase,
-                    result,
-                    flags=re.IGNORECASE,
+                    rf"\b{re.escape(alias)}\b", phrase, result, flags=re.IGNORECASE
                 )
     return result
 
@@ -204,7 +197,6 @@ def apply_dictionary_corrections(text: str) -> str:
 # =========================================================
 
 def should_update_dictionary() -> bool:
-    """True if 24h have passed since the last dictionary update."""
     path = storage_path("dictionary_last_update.json")
     if not path.exists():
         return True
@@ -222,7 +214,6 @@ def mark_dictionary_updated() -> None:
 
 
 def get_new_history_since_last_update() -> List[Dict[str, Any]]:
-    """Return only history items recorded after the last dictionary update."""
     path = storage_path("dictionary_last_update.json")
     last_ts = 0.0
     if path.exists():
@@ -230,15 +221,13 @@ def get_new_history_since_last_update() -> List[Dict[str, Any]]:
             last_ts = json.loads(path.read_text(encoding="utf-8")).get("last_update", 0.0)
         except Exception:
             pass
-
     return [
         item for item in load_history().get("items", [])
-        if item.get("ts", 0) / 1000 > last_ts   # ts stored in ms
+        if item.get("ts", 0) / 1000 > last_ts
     ]
 
 
 def get_optimal_sample_size(items: List[Any]) -> int:
-    """Scale sample size relative to number of new items."""
     total = len(items)
     if total == 0:   return 0
     if total < 20:   return total
@@ -247,7 +236,6 @@ def get_optimal_sample_size(items: List[Any]) -> int:
 
 
 def deduplicate_items(texts: List[str], threshold: int = 10) -> List[str]:
-    """Remove near-duplicates using a word-count fingerprint."""
     seen, unique = set(), []
     for text in texts:
         fp = " ".join(text.lower().split()[:threshold])
@@ -258,7 +246,6 @@ def deduplicate_items(texts: List[str], threshold: int = 10) -> List[str]:
 
 
 def prepare_items_for_agent(items: List[Dict[str, Any]]) -> List[str]:
-    """Strip all fields except final_text and deduplicate — saves ~60% tokens."""
     texts = [
         str(item.get("final_text", "")).strip()
         for item in items
@@ -268,7 +255,62 @@ def prepare_items_for_agent(items: List[Dict[str, Any]]) -> List[str]:
 
 
 # =========================================================
-# AI refine  (includes translation)
+# FAST PATH: Intent detection  (~1.5s, runs in parallel)
+#
+# Detects early whether the raw transcribed text is:
+#   "text"     → normal dictation, needs refine
+#   "calendar" → user wants schedule, skip refine
+#   "snippet"  → user wants a snippet, skip refine
+#
+# Uses a minimal prompt to keep latency low.
+# Runs concurrently with ai_refine_text so neither blocks the other.
+# =========================================================
+
+def detect_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
+    """Detect whether the text is a command or normal dictation.
+
+    Returns:
+        {
+            "type":     "text" | "calendar" | "snippet",
+            "trigger":  str | None,   # matched snippet trigger if type=snippet
+            "date":     str | None,   # extracted date if type=calendar
+            "calendar": str | None,   # calendar name if type=calendar
+        }
+    """
+    triggers_hint = (
+        f"Known snippet triggers: {json.dumps(snippet_triggers)}. "
+        if snippet_triggers else ""
+    )
+
+    agent = Agent(
+        model="gpt-5",
+        name="whispr_intent_detector",
+        system_prompt=(
+            "You are a fast intent classifier for a voice transcription app. "
+            "Classify the input as ONE of: 'text', 'calendar', or 'snippet'. "
+            "'calendar' = user asks for schedule/events/calendar. "
+            "'snippet' = user requests a known shortcut/snippet by name. "
+            "'text' = everything else (normal dictation). "
+            f"{triggers_hint}"
+            "Reply ONLY with compact JSON — no explanation:\n"
+            '{"type":"text|calendar|snippet",'
+            '"trigger":null_or_trigger_name,'
+            '"date":"today|tomorrow|YYYY-MM-DD|null",'
+            '"calendar":"name|all|null"}'
+        ),
+    )
+
+    try:
+        result = json.loads(str(agent.input(raw_text)).strip())
+        if result.get("type") not in INTENT_TYPES:
+            result["type"] = "text"
+        return result
+    except Exception:
+        return {"type": "text", "trigger": None, "date": None, "calendar": None}
+
+
+# =========================================================
+# AI refine  (runs in parallel with intent detection)
 # =========================================================
 
 def ai_refine_text(
@@ -276,20 +318,13 @@ def ai_refine_text(
     app_name: str = "",
     target_language: str = "",
 ) -> str:
-    """Refine transcribed text with optional translation.
+    """Refine + translate transcribed text.
 
-    - Detects the language automatically.
-    - Translates to target_language if the input differs.
-    - Removes disfluencies, fixes punctuation/grammar.
-    - Adapts tone to the active application.
-
-    Always passing app_name (even as "unknown") halves latency
-    compared to omitting it entirely.
+    Always pass app_name (even 'unknown') — halves latency vs empty string.
     """
     if not text.strip():
         return text
 
-    # Resolve language: argument > profile preference > default
     lang = target_language.strip()
     if not lang or lang not in SUPPORTED_LANGUAGES:
         lang = get_target_language()
@@ -306,24 +341,18 @@ def ai_refine_text(
         system_prompt=(
             "You are Whispr's text refinement agent.\n"
             f"{app_hint} "
-            "Use that to infer appropriate tone, formality, and context "
-            "(e.g. code-safe for an IDE, professional for email, casual for chat).\n\n"
-            "Your job — in order:\n"
-            "1. Detect the language of the input.\n"
-            f"2. If it is NOT {lang}, translate it to {lang}.\n"
-            "3. Remove false starts, repeated fragments, stutters, and disfluencies.\n"
-            "4. Fix punctuation, capitalisation, grammar, and readability.\n"
-            "5. Match tone to the application context.\n\n"
-            "Rules:\n"
-            "- Do NOT add new facts.\n"
-            "- Do NOT change meaning.\n"
-            "- Output ONLY the final refined text — nothing else."
+            "Use that to infer appropriate tone and context.\n\n"
+            "Steps:\n"
+            f"1. If input is NOT {lang}, translate it to {lang}.\n"
+            "2. Remove stutters, false starts, repeated words, disfluencies.\n"
+            "3. Fix punctuation, capitalisation, grammar.\n"
+            "4. Match tone to the application context.\n\n"
+            "Output ONLY the final refined text — nothing else."
         ),
     )
 
     return clean_agent_output(agent.input(
-        f"Input text:\n{text}\n\n"
-        f"Output only the final refined {lang} text."
+        f"Input text:\n{text}\n\nOutput only the final refined {lang} text."
     ))
 
 
@@ -337,16 +366,10 @@ def self_correct_text(
     app_name: str = "",
     target_language: str = "",
 ) -> str:
-    """Evaluate and iteratively correct refined text.
-
-    If eval score < SCORE_THRESHOLD, feeds the failure reason back into
-    a correction agent and retries up to MAX_RETRIES times.
-    Always returns the highest-scoring attempt.
-    """
     try:
         from Eval_run import run_refinement_eval
     except ImportError:
-        return initial_refined   # eval not available — skip silently
+        return initial_refined
 
     current    = initial_refined
     best_text  = initial_refined
@@ -354,9 +377,7 @@ def self_correct_text(
 
     for attempt in range(MAX_RETRIES):
         results = run_refinement_eval([{
-            "raw_text":  raw_text,
-            "final_text": current,
-            "app_name":  app_name,
+            "raw_text": raw_text, "final_text": current, "app_name": app_name,
         }], verbose=False)
 
         if not results:
@@ -374,26 +395,22 @@ def self_correct_text(
         if score >= SCORE_THRESHOLD:
             break
 
-        print(f"[self-correct] below threshold — retrying", file=sys.stderr)
-
-        lang = target_language.strip() or get_target_language()
-
+        lang  = target_language.strip() or get_target_language()
         agent = Agent(
             model="gpt-5",
             name="whispr_self_corrector",
             system_prompt=(
-                "You are Whispr's self-correction agent. "
-                "You receive a previous refinement attempt and the reason it failed. "
-                f"Fix the identified issues and output ONLY the corrected {lang} text. "
+                "Fix the issues in the previous refinement attempt. "
+                f"Output ONLY the corrected {lang} text. "
                 "Do NOT add facts or change meaning."
             ),
         )
         current = clean_agent_output(agent.input(
-            f"App context: {app_name or 'unknown'}\n\n"
-            f"Original raw text:\n{raw_text}\n\n"
+            f"App: {app_name or 'unknown'}\n"
+            f"Raw:\n{raw_text}\n\n"
             f"Previous attempt:\n{current}\n\n"
-            f"Evaluation feedback:\n{reason}\n\n"
-            f"Output only the corrected text."
+            f"Feedback:\n{reason}\n\n"
+            "Output corrected text only."
         ))
 
     return best_text
@@ -408,47 +425,125 @@ def transcribe_audio(audio_path: str) -> str:
 
 
 # =========================================================
-# Core pipeline
+# Core pipeline  — optimised with parallel intent detection
+#
+# Flow:
+#   1. transcribe (blocking — must finish first)
+#   2. load snippet triggers (instant — local file read)
+#   3. PARALLEL:
+#        a. detect_intent(raw_text)      ~1.5s
+#        b. ai_refine_text(raw_text)     ~4s
+#   4. Route on intent result:
+#        - "calendar" → fetch schedule (skip refine output)
+#        - "snippet"  → expand snippet  (skip refine output)
+#        - "text"     → use refine output → dictionary corrections
+#
+# Because intent detection (~1.5s) finishes before refine (~4s),
+# we can cancel or ignore refine early for command intents.
 # =========================================================
+
+def _load_snippet_triggers() -> List[str]:
+    """Load enabled snippet triggers — instant local read."""
+    try:
+        from snippets import load_snippets
+        data = load_snippets()
+        return [
+            item["trigger"]
+            for item in data.get("snippets", [])
+            if item.get("enabled", True) and str(item.get("trigger", "")).strip()
+        ]
+    except Exception:
+        return []
+
 
 def transcribe_and_enhance_impl(
     audio_path: str,
     app_name: str = "",
     target_language: str = "",
 ) -> Dict[str, Any]:
-    """Full pipeline: transcribe → refine+translate → self-correct → dict → snippets."""
-    audio_path = str(Path(audio_path).expanduser())
+    """Optimised pipeline with parallel intent detection."""
 
+    audio_path = str(Path(audio_path).expanduser())
     if not Path(audio_path).exists():
         return {"ok": False, "error": f"audio file not found: {audio_path}", "ts": now_ms()}
 
+    # Step 1 — transcribe (must complete before anything else)
+    t0 = time.perf_counter()
     raw_text = transcribe_audio(audio_path)
+    print(f"[pipeline] transcribe: {(time.perf_counter()-t0)*1000:.0f}ms", file=sys.stderr)
 
-    # Always pass app_name (even "unknown") — halves refine latency
+    if not raw_text.strip():
+        return {"ok": False, "error": "transcription returned empty text", "ts": now_ms()}
+
     effective_app = app_name.strip() or "unknown"
 
+    # Step 2 — load snippet triggers (instant)
+    snippet_triggers = _load_snippet_triggers()
+
+    # Step 3 — run intent detection AND refine IN PARALLEL
+    # Both start at the same time. Intent (~1.5s) finishes first.
+    # If intent is a command we use its result and discard refine.
+    # If intent is "text" we wait for refine to finish (~4s total, not 5.5s).
+    final_text = raw_text  # safe fallback
+
     try:
-        # 1. Refine + translate
-        initial_refined = ai_refine_text(
-            text=raw_text,
-            app_name=effective_app,
-            target_language=target_language,
-        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            intent_future = executor.submit(detect_intent, raw_text, snippet_triggers)
+            refine_future = executor.submit(
+                ai_refine_text, raw_text, effective_app, target_language
+            )
 
-        # 2. Self-correct if eval available
-        corrected = self_correct_text(
-            raw_text=raw_text,
-            initial_refined=initial_refined,
-            app_name=effective_app,
-            target_language=target_language,
-        )
+            # Intent finishes first (~1.5s) — route immediately
+            intent = intent_future.result()
+            intent_type = intent.get("type", "text")
 
-        # 3. Dictionary corrections
-        dict_corrected = apply_dictionary_corrections(corrected)
+            print(f"[pipeline] intent={intent_type}", file=sys.stderr)
 
-        # 4. Snippet expansion
-        from snippets import apply_snippets
-        final_text = apply_snippets(dict_corrected)
+            if intent_type == "calendar":
+                # Skip refine — fetch calendar directly
+                refine_future.cancel()
+                try:
+                    from gcalendar import get_schedule
+                    import getpass
+                    date     = intent.get("date") or "today"
+                    cal_filt = intent.get("calendar") or "all"
+                    final_text = get_schedule(
+                        date=date,
+                        user_id=getpass.getuser(),
+                        calendar_filter=cal_filt,
+                    )
+                except Exception as e:
+                    final_text = f"Could not fetch calendar: {e}"
+
+            elif intent_type == "snippet":
+                # Skip refine — expand snippet directly
+                refine_future.cancel()
+                trigger = intent.get("trigger")
+                try:
+                    from snippets import load_snippets, handle_dynamic_trigger
+                    from snippets import DYNAMIC_TRIGGERS
+                    data     = load_snippets()
+                    snippets = {
+                        item["trigger"]: item["expansion"]
+                        for item in data.get("snippets", [])
+                        if item.get("enabled", True)
+                    }
+                    if trigger and trigger in snippets:
+                        if trigger.lower() in DYNAMIC_TRIGGERS:
+                            final_text = handle_dynamic_trigger(trigger, raw_text)
+                        else:
+                            final_text = snippets[trigger]
+                    else:
+                        # Trigger not found — fall back to refine
+                        final_text = apply_dictionary_corrections(refine_future.result())
+                except Exception:
+                    final_text = apply_dictionary_corrections(refine_future.result())
+
+            else:
+                # Normal text — wait for refine (already running in parallel)
+                refined    = refine_future.result()
+                corrected  = self_correct_text(raw_text, refined, effective_app, target_language)
+                final_text = apply_dictionary_corrections(corrected)
 
     except Exception as exc:
         print(f"[pipeline] error — falling back to raw: {exc}", file=sys.stderr)
@@ -471,25 +566,19 @@ def transcribe_and_enhance_impl(
 # =========================================================
 
 def create_or_update_profile(
-    name: str = "",
-    email: str = "",
-    organization: str = "",
-    role: str = "",
+    name: str = "", email: str = "",
+    organization: str = "", role: str = "",
     target_language: str = "",
 ) -> Dict[str, Any]:
-    """Update user profile fields. Pass target_language to change output language."""
     profile = load_profile()
-
     for key, value in {
         "name": name, "email": email,
         "organization": organization, "role": role,
     }.items():
         if str(value).strip():
             profile[key] = str(value).strip()
-
     if target_language.strip() in SUPPORTED_LANGUAGES:
         profile.setdefault("preferences", {})["target_language"] = target_language.strip()
-
     save_profile(profile)
     return {"ok": True, "profile": profile}
 
@@ -519,9 +608,8 @@ def create_agent() -> Agent:
         model="gpt-5",
         name="whispr_orchestrator",
         system_prompt=(
-            "You are Whispr. You orchestrate audio transcription, text refinement, "
-            "and translation. You can update the user profile to change preferences "
-            "such as the output language."
+            "You are Whispr. You orchestrate audio transcription, "
+            "text refinement, and translation."
         ),
     )
     for fn in (create_or_update_profile, get_profile, transcribe_and_enhance):
@@ -542,7 +630,7 @@ if __name__ == "__main__":
 
         command = sys.argv[2]
 
-        # ── transcribe ───────────────────────────────────
+        # ── transcribe ──────────────────────────────────
         if command == "transcribe":
             audio_path      = sys.argv[3] if len(sys.argv) > 3 else ""
             app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
@@ -565,18 +653,19 @@ if __name__ == "__main__":
                 print(f"ERROR: {str(e)}", file=sys.stderr)
                 sys.exit(1)
 
-        # ── calendar ─────────────────────────────────────
+        # ── calendar ────────────────────────────────────
         elif command == "calendar":
             import getpass
             text    = sys.argv[3] if len(sys.argv) > 3 else "today"
             user_id = sys.argv[4] if len(sys.argv) > 4 else getpass.getuser()
-
             try:
                 from gcalendar import get_schedule, extract_calendar_intent
                 intent   = extract_calendar_intent(text)
-                date     = intent.get("date", "today")
-                cal_filt = intent.get("calendar", "all")
-                schedule = get_schedule(date=date, user_id=user_id, calendar_filter=cal_filt)
+                schedule = get_schedule(
+                    date=intent.get("date", "today"),
+                    user_id=user_id,
+                    calendar_filter=intent.get("calendar", "all"),
+                )
                 print(json.dumps({"output": schedule}, ensure_ascii=False))
                 sys.exit(0)
             except Exception as e:
@@ -584,19 +673,19 @@ if __name__ == "__main__":
                 print(f"ERROR: {str(e)}", file=sys.stderr)
                 sys.exit(1)
 
-        # ── set-language ──────────────────────────────────
+        # ── set-language ─────────────────────────────────
         elif command == "set-language":
             language = sys.argv[3] if len(sys.argv) > 3 else ""
             ok = set_target_language(language)
             print(json.dumps({
                 "ok": ok,
                 "language": language,
-                "error": f"unsupported language: {language}" if not ok else None,
+                "error": f"unsupported: {language}" if not ok else None,
                 "supported": SUPPORTED_LANGUAGES,
             }, ensure_ascii=False))
             sys.exit(0 if ok else 1)
 
-        # ── get-language ──────────────────────────────────
+        # ── get-language ─────────────────────────────────
         elif command == "get-language":
             print(json.dumps({
                 "ok": True,
