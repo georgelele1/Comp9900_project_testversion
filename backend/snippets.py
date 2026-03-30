@@ -2,11 +2,11 @@
 Snippets module for Whispr.
 
 Voice shortcuts that expand to full text or live data.
-  "give me my zoom link"          → pastes static URL
-  "what's my schedule tomorrow"   → calls get_calendar tool → fetches events
+  "give me my zoom link"       → pastes static URL
+  "check my schedule tomorrow" → calls get_calendar tool → fetches events
 
 Static snippets are listed in the agent system prompt.
-Dynamic snippets are registered as tools the agent can call.
+Dynamic snippets (calendar) are registered as agent tools.
 
 Storage: ~/Library/Application Support/Whispr/snippets.json
 CLI:
@@ -16,48 +16,33 @@ CLI:
     python snippets.py cli toggle <trigger> <true|false>
     python snippets.py cli expand <text>
 """
-
 from __future__ import annotations
 
 import getpass
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 from connectonion import Agent
-from app import register_tool
 
-APP_NAME      = "Whispr"
-SNIPPETS_FILE = "snippets.json"
+# Shared helpers from app — avoids duplicating app_support_dir / storage_path
+from app import app_support_dir, register_tool
 
-# Triggers handled via agent tools (not static text expansion)
+SNIPPETS_FILE    = "snippets.json"
 DYNAMIC_TRIGGERS = {"calendar"}
 
 
 # =========================================================
-# Paths / storage
+# Storage
 # =========================================================
 
-def app_support_dir() -> Path:
-    home = Path.home()
-    if sys.platform == "darwin":
-        base = home / "Library" / "Application Support" / APP_NAME
-    elif os.name == "nt":
-        base = Path(os.environ.get("APPDATA", str(home))) / APP_NAME
-    else:
-        base = home / ".local" / "share" / APP_NAME
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def storage_path() -> Path:
+def _storage_path() -> Path:
     return app_support_dir() / SNIPPETS_FILE
 
 
 def load_snippets() -> Dict[str, Any]:
-    path = storage_path()
+    path = _storage_path()
     if not path.exists():
         return {"snippets": []}
     try:
@@ -66,10 +51,8 @@ def load_snippets() -> Dict[str, Any]:
         return {"snippets": []}
 
 
-def save_snippets(data: Dict[str, Any]) -> None:
-    storage_path().write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+def _save_snippets(data: Dict[str, Any]) -> None:
+    _storage_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # =========================================================
@@ -77,17 +60,11 @@ def save_snippets(data: Dict[str, Any]) -> None:
 # =========================================================
 
 def list_all() -> Dict[str, Any]:
-    """Return all snippets."""
     data = load_snippets()
-    return {
-        "ok":       True,
-        "snippets": data.get("snippets", []),
-        "count":    len(data.get("snippets", [])),
-    }
+    return {"ok": True, "snippets": data.get("snippets", []), "count": len(data.get("snippets", []))}
 
 
 def add_snippet(trigger: str, expansion: str) -> Dict[str, Any]:
-    """Add a new snippet or update an existing one."""
     trigger   = str(trigger   or "").strip()
     expansion = str(expansion or "").strip()
     if not trigger:   return {"ok": False, "error": "trigger is required"}
@@ -100,39 +77,34 @@ def add_snippet(trigger: str, expansion: str) -> Dict[str, Any]:
         if str(item.get("trigger", "")).lower() == trigger.lower():
             item["expansion"] = expansion
             item["enabled"]   = True
-            save_snippets(data)
+            _save_snippets(data)
             return {"ok": True, "updated": True, "snippet": item}
 
     entry = {"trigger": trigger, "expansion": expansion, "enabled": True}
     snippets.append(entry)
     data["snippets"] = snippets
-    save_snippets(data)
+    _save_snippets(data)
     return {"ok": True, "updated": False, "snippet": entry}
 
 
 def remove_snippet(trigger: str) -> Dict[str, Any]:
-    """Remove a snippet by trigger."""
     trigger = str(trigger or "").strip()
     if not trigger:
         return {"ok": False, "error": "trigger is required"}
 
     data     = load_snippets()
     snippets = data.get("snippets", [])
-    filtered = [
-        s for s in snippets
-        if str(s.get("trigger", "")).lower() != trigger.lower()
-    ]
+    filtered = [s for s in snippets if str(s.get("trigger", "")).lower() != trigger.lower()]
 
     if len(filtered) == len(snippets):
         return {"ok": False, "error": f"snippet not found: {trigger}"}
 
     data["snippets"] = filtered
-    save_snippets(data)
+    _save_snippets(data)
     return {"ok": True, "removed": trigger, "remaining": len(filtered)}
 
 
 def toggle_snippet(trigger: str, enabled: bool = True) -> Dict[str, Any]:
-    """Enable or disable a snippet."""
     trigger = str(trigger or "").strip()
     if not trigger:
         return {"ok": False, "error": "trigger is required"}
@@ -141,33 +113,26 @@ def toggle_snippet(trigger: str, enabled: bool = True) -> Dict[str, Any]:
     for item in data.get("snippets", []):
         if str(item.get("trigger", "")).lower() == trigger.lower():
             item["enabled"] = bool(enabled)
-            save_snippets(data)
+            _save_snippets(data)
             return {"ok": True, "trigger": trigger, "enabled": item["enabled"]}
 
     return {"ok": False, "error": f"snippet not found: {trigger}"}
 
 
 # =========================================================
-# Dynamic tools
+# Calendar tool (registered as agent tool — not called directly)
 # =========================================================
 
 def get_calendar(date: str = "today", calendar_filter: str = "all") -> str:
     """Fetch Google Calendar events for a given date.
 
     Args:
-        date: 'today', 'tomorrow', or a YYYY-MM-DD string.
-        calendar_filter: calendar name to filter by, or 'all' for all calendars.
-
-    Returns:
-        Formatted schedule string.
+        date:            'today', 'tomorrow', or YYYY-MM-DD.
+        calendar_filter: calendar name to filter by, or 'all'.
     """
     try:
         from gcalendar import get_schedule
-        return get_schedule(
-            date=date,
-            user_id=getpass.getuser(),
-            calendar_filter=calendar_filter,
-        )
+        return get_schedule(date=date, user_id=getpass.getuser(), calendar_filter=calendar_filter)
     except Exception as e:
         return f"Could not fetch calendar: {e}"
 
@@ -176,19 +141,10 @@ def get_calendar(date: str = "today", calendar_filter: str = "all") -> str:
 # Snippet expansion agent
 # =========================================================
 
-def build_snippet_agent(static_snippets: Dict[str, str]) -> Agent:
-    """Build the snippet agent with static snippets in the prompt
-    and dynamic tools registered.
-
-    Static snippets are baked into the system prompt — agent returns
-    them directly with no tool call (zero extra latency).
-
-    Dynamic triggers (calendar) are registered as tools. The agent MUST
-    only call get_calendar when the user explicitly mentions 'calendar'
-    or asks for their schedule — never for any other trigger.
-    """
-    # Separate static from dynamic
-    static_map  = {t: e for t, e in static_snippets.items() if t.lower() not in DYNAMIC_TRIGGERS}
+def _build_agent(static_snippets: Dict[str, str]) -> Agent:
+    """Build agent with static snippets baked into the prompt and
+    the calendar tool registered for dynamic expansion."""
+    static_map   = {t: e for t, e in static_snippets.items() if t.lower() not in DYNAMIC_TRIGGERS}
     has_calendar = "calendar" in static_snippets
 
     static_lines = "\n".join(
@@ -196,64 +152,43 @@ def build_snippet_agent(static_snippets: Dict[str, str]) -> Agent:
         for t, e in static_map.items()
     )
 
-    system_prompt = (
-        "You are Whispr's snippet expansion agent.\n"
-        "Given transcribed speech, check if it matches a snippet trigger.\n\n"
-    )
+    prompt = "You are Whispr's snippet expansion agent.\n"
 
     if static_lines:
-        system_prompt += (
-            "STATIC SNIPPETS — if the user's text matches, return ONLY the expansion text:\n"
+        prompt += (
+            "STATIC SNIPPETS — return expansion text directly, NO tool calls:\n"
             f"{static_lines}\n\n"
-            "CRITICAL: For static snippets, NEVER call any tool. "
-            "Return the expansion text directly and immediately.\n\n"
         )
 
     if has_calendar:
-        system_prompt += (
-            "DYNAMIC SNIPPET — calendar:\n"
-            "  If the user asks for their schedule, calendar, or events: "
-            "call get_calendar(date, calendar_filter).\n"
-            "  ONLY call get_calendar for calendar/schedule requests. "
-            "NEVER call it for any other trigger.\n\n"
+        prompt += (
+            "DYNAMIC — calendar:\n"
+            "  If user asks for schedule/events/calendar: call get_calendar(date, calendar_filter).\n"
+            "  ONLY call get_calendar for calendar requests. NEVER for other triggers.\n\n"
         )
 
-    system_prompt += (
+    prompt += (
         "RULES:\n"
-        "1. Static snippet match → return expansion text ONLY. No tool calls.\n"
-        "2. Calendar request → call get_calendar once with correct args.\n"
-        "3. No match → return the original text UNCHANGED.\n"
-        "4. Never add explanation or extra text. Output the result only."
+        "1. Static match → return expansion text only. No tools.\n"
+        "2. Calendar request → call get_calendar once.\n"
+        "3. No match → return original text unchanged.\n"
+        "4. No explanation or extra text."
     )
 
-    agent = Agent(
-        model="gpt-5",
-        name="whispr_snippet_agent",
-        system_prompt=system_prompt,
-    )
-
-    # Only register calendar tool if calendar snippet exists
+    agent = Agent(model="gpt-5", name="whispr_snippet_agent", system_prompt=prompt)
     if has_calendar:
         register_tool(agent, get_calendar)
-
     return agent
 
 
 def apply_snippets(text: str) -> str:
-    """Expand snippet triggers using an agent with registered tools.
-
-    The agent handles both detection and expansion in one call:
-    - Static snippets: returned directly from system prompt knowledge
-    - Dynamic snippets (calendar): agent calls the tool with correct args
-    - No match: original text returned unchanged
-    """
+    """Detect and expand snippet triggers using agent + registered tools."""
     if not text or not text.strip():
         return text
 
-    data     = load_snippets()
     snippets = {
         item["trigger"]: item["expansion"]
-        for item in data.get("snippets", [])
+        for item in load_snippets().get("snippets", [])
         if item.get("enabled", True)
         and str(item.get("trigger",   "")).strip()
         and str(item.get("expansion", "")).strip()
@@ -262,10 +197,7 @@ def apply_snippets(text: str) -> str:
     if not snippets:
         return text
 
-    agent  = build_snippet_agent(snippets)
-    result = str(agent.input(text)).strip().strip('"').strip("'").strip()
-
-    # Safety check: if result is empty fall back to original text
+    result = str(_build_agent(snippets).input(text)).strip().strip('"').strip("'").strip()
     return result if result else text
 
 
@@ -296,29 +228,23 @@ if __name__ == "__main__":
 
         elif command == "toggle":
             trigger = sys.argv[3] if len(sys.argv) > 3 else ""
-            enabled = (
-                sys.argv[4].lower() not in ("false", "0", "no")
-                if len(sys.argv) > 4 else True
-            )
+            enabled = sys.argv[4].lower() not in ("false", "0", "no") if len(sys.argv) > 4 else True
             print(json.dumps(toggle_snippet(trigger, enabled), ensure_ascii=False))
 
         elif command == "expand":
-            text     = sys.argv[3] if len(sys.argv) > 3 else ""
-            expanded = apply_snippets(text)
+            text = sys.argv[3] if len(sys.argv) > 3 else ""
             print(json.dumps(
-                {"ok": True, "original": text, "expanded": expanded},
+                {"ok": True, "original": text, "expanded": apply_snippets(text)},
                 ensure_ascii=False,
             ))
 
         else:
-            print(json.dumps(
-                {"ok": False, "error": f"unknown command: {command}"},
-                ensure_ascii=False,
-            ))
+            print(json.dumps({"ok": False, "error": f"unknown command: {command}"}, ensure_ascii=False))
+            sys.exit(1)
 
         sys.exit(0)
 
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
-        print(f"ERROR: {str(e)}", file=sys.stderr)
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
