@@ -34,11 +34,9 @@ ENABLE_SELF_CORRECT = False
 SCORE_THRESHOLD     = 70
 MAX_RETRIES         = 2
 
-# ── Intent detection ─────────────────────────────────────
-# Hard deny catches obvious non-calendar text instantly (0ms).
-# Everything else goes to the agent (~1.5s) which handles
-# calendar, search, snippet, and text naturally.
+# ── Calendar intent regexes ───────────────────────────────
 
+# Tier 1: calendar words present but clearly NOT a fetch request
 _CALENDAR_DENY = re.compile(
     r"\b("
     r"(my |the )?(calendar|schedule) is (full|busy|packed|crazy|hectic|clear|empty|free)"
@@ -49,6 +47,199 @@ _CALENDAR_DENY = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+# Tier 2: unambiguously requesting a calendar fetch
+_CALENDAR_ALLOW = re.compile(
+    r"\b("
+    r"(show|check|see|get|what.?s|give me|tell me|look at|open|pull up|read)"
+    r"\s+(me\s+)?(my\s+)?(schedule|calendar|events?|agenda|appointments?|meetings?)"
+    r"|what.?s\s+(on|happening)\s+(today|tomorrow|this week|next week|monday|tuesday|wednesday|thursday|friday)"
+    r"|am\s+i\s+(free|available|busy)\s+(today|tomorrow|on|this|next)"
+    r"|do\s+i\s+have\s+(anything|something|a meeting|an appointment)"
+    r"|what\s+time\s+is\s+my|when\s+is\s+my\s+next"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Tier 3 gate: calendar keywords that might be ambiguous
+_CALENDAR_KEYWORDS = re.compile(
+    r"\b(schedule|calendar|events?|meeting|appointment|agenda|free|available|busy)\b",
+    re.IGNORECASE,
+)
+
+# Snippet: action verb + known trigger word
+_SNIPPET_ALLOW = re.compile(
+    r"^\s*(give me|insert|paste|use|add|put|show me|open|pull up)",
+    re.IGNORECASE,
+)
+
+# Search: user wants to find a specific event by keyword
+_CALENDAR_SEARCH = re.compile(
+    r"("
+    r"(search|find|look for|when is|when.?s|what date is|what day is)"
+    r"\s+(my\s+)?(.*?)\s*(in|on|at)?\s*(calendar|schedule)?"
+    r"|when is (my\s+)?(exam|test|assignment|deadline|appointment|class|lecture|meeting)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# =========================================================
+# Storage helpers
+# =========================================================
+
+def app_support_dir() -> Path:
+    home = Path.home()
+    if sys.platform == "darwin":
+        base = home / "Library" / "Application Support" / APP_NAME
+    elif os.name == "nt":
+        base = Path(os.environ.get("APPDATA", str(home))) / APP_NAME
+    else:
+        base = home / ".local" / "share" / APP_NAME
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def storage_path(filename: str) -> Path:
+    return app_support_dir() / filename
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_store(filename: str, default: Any) -> Any:
+    return _read_json(storage_path(filename), default)
+
+
+def save_store(filename: str, data: Any) -> None:
+    _write_json(storage_path(filename), data)
+
+
+# =========================================================
+# Profile / history / dictionary accessors
+# =========================================================
+
+def load_profile() -> Dict[str, Any]:
+    return load_store(PROFILE_FILE, {
+        "name": "", "email": "", "organization": "", "role": "",
+        "preferences": {"target_language": DEFAULT_LANGUAGE},
+    })
+
+
+def save_profile(profile: Dict[str, Any]) -> None:
+    save_store(PROFILE_FILE, profile)
+
+
+def load_dictionary() -> Dict[str, Any]:
+    return load_store(DICTIONARY_FILE, {"terms": []})
+
+
+def load_history() -> Dict[str, Any]:
+    return load_store(HISTORY_FILE, {"items": []})
+
+
+def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
+    data  = load_history()
+    items = data.get("items", [])
+    items.append(item)
+    data["items"] = items[-max_items:]
+    save_store(HISTORY_FILE, data)
+
+
+def get_target_language() -> str:
+    lang = load_profile().get("preferences", {}).get("target_language", DEFAULT_LANGUAGE)
+    return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+
+def set_target_language(language: str) -> bool:
+    if language not in SUPPORTED_LANGUAGES:
+        return False
+    profile = load_profile()
+    profile.setdefault("preferences", {})["target_language"] = language
+    save_profile(profile)
+    return True
+
+
+# =========================================================
+# Common helpers
+# =========================================================
+
+def _clean(result: Any) -> str:
+    return str(result).strip().strip('"').strip("'").strip()
+
+
+def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
+    for attr in ("add_tools", "add_tool"):
+        if hasattr(agent, attr) and callable(getattr(agent, attr)):
+            getattr(agent, attr)(fn)
+            return
+    reg = getattr(agent, "tools", None)
+    if reg is not None:
+        for meth in ("register", "add", "add_tool", "add_function", "append"):
+            m = getattr(reg, meth, None)
+            if callable(m):
+                m(fn)
+                return
+    raise RuntimeError("Cannot register tool.")
+
+
+# =========================================================
+# Dictionary corrections
+# =========================================================
+
+def get_dictionary_terms() -> Dict[str, Any]:
+    """Tool: return approved dictionary terms so the refiner agent
+    can apply corrections in context during refinement."""
+    terms = [
+        {"phrase": str(item.get("phrase", "")).strip(),
+         "aliases": item.get("aliases", [])}
+        for item in load_dictionary().get("terms", [])
+        if item.get("approved", True) and str(item.get("phrase", "")).strip()
+    ]
+    return {"terms": terms, "count": len(terms)}
+
+
+def apply_dictionary_corrections(text: str) -> str:
+    """Fallback regex corrections — used only when agent is skipped (short clean text)."""
+    if not text.strip():
+        return text
+    result = text
+    for item in load_dictionary().get("terms", []):
+        if not item.get("approved", True):
+            continue
+        phrase = str(item.get("phrase", "")).strip()
+        if not phrase:
+            continue
+        for alias in item.get("aliases", []):
+            alias = str(alias).strip()
+            if alias:
+                result = re.sub(
+                    rf"\b{re.escape(alias)}\b", phrase, result, flags=re.IGNORECASE
+                )
+    return result
+
+
+# =========================================================
+# Intent detection — 3-tier hybrid
+#
+#  Tier 1 (0ms)   hard DENY regex  — calendar words but NOT a request
+#  Tier 2 (0ms)   hard ALLOW regex — unambiguous fetch request
+#  Tier 3 (~1.5s) LLM fallback     — ambiguous calendar context only
+# =========================================================
 
 def _load_snippet_triggers() -> List[str]:
     try:
@@ -62,49 +253,61 @@ def _load_snippet_triggers() -> List[str]:
         return []
 
 
-def detect_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
-    """Detect intent using a hard deny regex + agent.
-
-    Flow:
-        1. Hard deny (0ms)  — obvious non-calendar phrases → text immediately
-        2. Agent (~1.5s)    — classifies everything else as
-                              text / calendar / search / snippet
-    """
-    # Hard deny: calendar words present but clearly NOT a request
-    if _CALENDAR_DENY.search(raw_text):
-        print("[intent] deny → text", file=sys.stderr)
-        return {"type": "text", "trigger": None, "date": None, "calendar": None}
-
-    # Agent handles everything else
-    triggers_hint = (
-        f"Known snippet triggers: {json.dumps(snippet_triggers)}. "
-        if snippet_triggers else ""
-    )
+def _llm_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
     agent = Agent(
         model="gpt-5",
         name="whispr_intent_detector",
         system_prompt=(
-            "Classify voice input into exactly one type: 'text', 'calendar', 'search', or 'snippet'.\n"
-            "'calendar' = user wants to SEE their schedule for a date (e.g. what's on today, show my schedule).\n"
-            "'search'   = user wants to FIND a specific event by name (e.g. when is my exam, find my dentist).\n"
-            "'snippet'  = user requests a known shortcut by name.\n"
-            "'text'     = normal dictation — anything else.\n"
-            + triggers_hint +
-            "Reply ONLY with compact JSON — no explanation:\n"
-            '{"type":"text|calendar|search|snippet","trigger":null,"date":"today|tomorrow|YYYY-MM-DD|null","calendar":"name|all|null"}'
+            "Classify voice input as 'text', 'calendar', or 'snippet'. "
+            "'calendar' = user REQUESTS to SEE/CHECK their schedule or events — "
+            "NOT if they are merely mentioning being busy. "
+            "'snippet' = user requests a known shortcut by name. "
+            "'text' = normal dictation. "
+            + (f"Known snippet triggers: {json.dumps(snippet_triggers)}. " if snippet_triggers else "")
+            + 'Reply ONLY with JSON: {"type":"...","trigger":null,"date":"today|tomorrow|YYYY-MM-DD","calendar":"name|all"}'
         ),
     )
     try:
         result = json.loads(_clean(agent.input(raw_text)))
-        intent_type = result.get("type", "text")
-        if intent_type not in {"text", "calendar", "search", "snippet"}:
-            intent_type = "text"
-        result["type"] = intent_type
-        print(f"[intent] agent → {intent_type}", file=sys.stderr)
+        if result.get("type") not in {"text", "calendar", "snippet"}:
+            result["type"] = "text"
         return result
     except Exception:
-        print("[intent] agent failed → text", file=sys.stderr)
         return {"type": "text", "trigger": None, "date": None, "calendar": None}
+
+
+def detect_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
+    text_lower = raw_text.lower()
+
+    # Tier 1: hard deny
+    if _CALENDAR_DENY.search(raw_text):
+        print("[intent] deny → text", file=sys.stderr)
+        return {"type": "text", "trigger": None, "date": None, "calendar": None}
+
+    # Snippet check
+    if _SNIPPET_ALLOW.search(raw_text):
+        for trigger in snippet_triggers:
+            if trigger.lower() in text_lower:
+                print(f"[intent] snippet → {trigger}", file=sys.stderr)
+                return {"type": "snippet", "trigger": trigger, "date": None, "calendar": None}
+
+    # Search: looking for a specific event by keyword
+    if _CALENDAR_SEARCH.search(raw_text):
+        print("[intent] search → calendar search", file=sys.stderr)
+        return {"type": "search", "trigger": None, "date": None, "calendar": None}
+
+    # Tier 2: hard allow
+    if _CALENDAR_ALLOW.search(raw_text):
+        print("[intent] allow → calendar", file=sys.stderr)
+        return {"type": "calendar", "trigger": None, "date": None, "calendar": None}
+
+    # Tier 3: LLM only when keywords present but ambiguous
+    if _CALENDAR_KEYWORDS.search(raw_text):
+        print("[intent] ambiguous → LLM", file=sys.stderr)
+        return _llm_intent(raw_text, snippet_triggers)
+
+    print("[intent] no signal → text", file=sys.stderr)
+    return {"type": "text", "trigger": None, "date": None, "calendar": None}
 
 
 # =========================================================
