@@ -7,11 +7,11 @@ keyed by the user's actual Google email address.
 First run opens a browser for one-time Google approval.
 Subsequent runs refresh silently using the stored token.
 
-Usage:
-    python gcalendar.py today
-    python gcalendar.py tomorrow
-    python gcalendar.py get-email
-    python gcalendar.py connect
+CLI:
+    python gcalendar.py connect     # first-time OAuth
+    python gcalendar.py get-email   # print saved Google email
+    python gcalendar.py today       # print today's schedule
+    python gcalendar.py tomorrow    # print tomorrow's schedule
 """
 from __future__ import annotations
 
@@ -24,11 +24,12 @@ import webbrowser
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytz
-from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
@@ -42,10 +43,11 @@ SCOPES           = [
 ]
 REDIRECT_URI     = "http://localhost:8765/callback"
 CREDENTIALS_FILE = Path(__file__).resolve().parent / "credentials.json"
+DEFAULT_TZ       = "Australia/Sydney"
 
 
 # =========================================================
-# Per-user token storage (keyed by Google email)
+# Token storage  (keyed by Google email, not system username)
 # =========================================================
 
 def _tokens_dir() -> Path:
@@ -79,11 +81,11 @@ def load_current_email() -> str | None:
 
 
 # =========================================================
-# OAuth flow (browser-based, one-time per Google account)
+# OAuth flow  (browser-based, one-time per Google account)
 # =========================================================
 
 def run_oauth_flow() -> tuple[Credentials, str]:
-    """Open browser for Google login, return (credentials, email)."""
+    """Open browser for Google login, save token, return (credentials, email)."""
     flow = Flow.from_client_secrets_file(
         str(CREDENTIALS_FILE), scopes=SCOPES, redirect_uri=REDIRECT_URI,
     )
@@ -101,14 +103,15 @@ def run_oauth_flow() -> tuple[Credentials, str]:
                 auth_code["value"] = params.get("code", [None])[0]
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(b"""
-                    <html><body style='font-family:sans-serif;text-align:center;padding:60px'>
-                    <h2>Whispr connected to Google Calendar</h2>
-                    <p>You can close this tab.</p>
-                    </body></html>
-                """)
+                self.wfile.write(
+                    b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                    b"<h2>Whispr connected to Google Calendar</h2>"
+                    b"<p>You can close this tab.</p></body></html>"
+                )
                 server_done.set()
-        def log_message(self, *_): pass
+
+        def log_message(self, *_):
+            pass
 
     threading.Thread(
         target=lambda: HTTPServer(("localhost", 8765), _Handler).handle_request(),
@@ -137,66 +140,100 @@ def run_oauth_flow() -> tuple[Credentials, str]:
 
 
 # =========================================================
-# Auth
+# Auth  (in-memory cache — one disk read + zero OAuth per process)
 # =========================================================
+
+_creds_cache: dict[str, Credentials] = {}
+
 
 def get_credentials(user_id: str | None = None) -> tuple[Credentials, str]:
-    """Return (valid_credentials, google_email), triggering OAuth if needed."""
+    """Return (valid_credentials, google_email), triggering OAuth only on first run.
+
+    Priority:
+        1. In-memory cache (valid)
+        2. In-memory cache (expired) → refresh in place
+        3. Token file on disk
+        4. OAuth browser flow (first time only)
+    """
     email = user_id or load_current_email()
 
-    if email:
-        path  = _token_path(email)
-        creds = None
+    if email and email in _creds_cache:
+        cached = _creds_cache[email]
+        if cached.valid:
+            return cached, email
+        if cached.expired and cached.refresh_token:
+            cached.refresh(Request())
+            _token_path(email).write_text(cached.to_json(), encoding="utf-8")
+            _creds_cache[email] = cached
+            return cached, email
 
+    if email:
+        path = _token_path(email)
         if path.exists():
             creds = Credentials.from_authorized_user_file(str(path), SCOPES)
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                path.write_text(creds.to_json(), encoding="utf-8")
+            if creds and creds.valid:
+                _creds_cache[email] = creds
+                return creds, email
 
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            path.write_text(creds.to_json(), encoding="utf-8")
-            return creds, email
-
-        if creds and creds.valid:
-            return creds, email
-
-    return run_oauth_flow()
+    creds, email = run_oauth_flow()
+    _creds_cache[email] = creds
+    return creds, email
 
 
 # =========================================================
-# Intent extraction
+# Shared helpers
 # =========================================================
 
-def extract_calendar_intent(text: str) -> dict:
-    """Extract date and calendar name from transcribed speech in one LLM call.
+def _get_calendars(service: Any, calendar_filter: str) -> list:
+    """Return calendar list, optionally filtered by name substring."""
+    all_cals = service.calendarList().list().execute().get("items", [])
+    if calendar_filter == "all":
+        return all_cals
+    return [c for c in all_cals if calendar_filter.lower() in c.get("summary", "").lower()]
 
-    Returns {"date": "today|tomorrow|YYYY-MM-DD", "calendar": "name|all"}.
-    """
-    agent = Agent(
-        model="gpt-5",
-        name="whispr_calendar_intent",
-        system_prompt=(
-            "Extract date and calendar from speech. "
-            'Reply ONLY with JSON: {"date":"today|tomorrow|YYYY-MM-DD","calendar":"name|all"}. '
-            "Default date=today, calendar=all if not mentioned. No explanation."
-        ),
-    )
+
+def _sort_events(events: list) -> list:
+    return sorted(events, key=lambda e: e["start"].get("dateTime", e["start"].get("date", "")))
+
+
+def _fmt_event(event: dict) -> str:
+    """Format event as '  - HH:MM AM: Title [Calendar]'."""
+    raw     = event["start"].get("dateTime", event["start"].get("date", ""))
+    summary = event.get("summary", "Untitled event")
+    cal     = event.get("_cal", "")
     try:
-        return json.loads(str(agent.input(text)).strip())
+        time_str = datetime.fromisoformat(raw).strftime("%I:%M %p")
     except Exception:
-        return {"date": "today", "calendar": "all"}
+        time_str = raw
+    return f"  - {time_str}: {summary} [{cal}]"
+
+
+def _fmt_event_with_date(event: dict) -> str:
+    """Format event as '  - Mon DD Mon HH:MM AM: Title [Calendar]'."""
+    raw     = event["start"].get("dateTime", event["start"].get("date", ""))
+    summary = event.get("summary", "Untitled event")
+    cal     = event.get("_cal", "")
+    try:
+        dt = datetime.fromisoformat(raw)
+        return f"  - {dt.strftime('%a %d %b')} {dt.strftime('%I:%M %p')}: {summary} [{cal}]"
+    except Exception:
+        return f"  - {raw}: {summary} [{cal}]"
 
 
 # =========================================================
-# Schedule fetcher
+# Schedule fetch
 # =========================================================
 
 def get_schedule(
     date: str = "today",
-    timezone: str = "Australia/Sydney",
+    timezone: str = DEFAULT_TZ,
     user_id: str | None = None,
     calendar_filter: str = "all",
 ) -> str:
-    """Fetch and format Google Calendar events for a given date.
+    """Fetch and format all events on a given date.
 
     Args:
         date:            'today', 'tomorrow', or YYYY-MM-DD.
@@ -224,41 +261,130 @@ def get_schedule(
         start = target.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
         end   = target.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
 
-        all_cals  = service.calendarList().list().execute().get("items", [])
-        calendars = (
-            all_cals if calendar_filter == "all"
-            else [c for c in all_cals if calendar_filter.lower() in c.get("summary", "").lower()]
-        )
-
         all_events = []
-        for cal in calendars:
+        for cal in _get_calendars(service, calendar_filter):
             for event in service.events().list(
-                calendarId=cal["id"], timeMin=start, timeMax=end,
-                singleEvents=True, orderBy="startTime",
+                calendarId=cal["id"],
+                timeMin=start,
+                timeMax=end,
+                singleEvents=True,
+                orderBy="startTime",
             ).execute().get("items", []):
                 event["_cal"] = cal.get("summary", cal["id"])
                 all_events.append(event)
 
-        all_events.sort(key=lambda e: e["start"].get("dateTime", e["start"].get("date", "")))
+        all_events = _sort_events(all_events)
 
         if not all_events:
             return f"No events found for {date} ({email})."
 
-        lines = [f"Schedule for {date} ({email}):"]
-        for event in all_events:
-            raw     = event["start"].get("dateTime", event["start"].get("date", ""))
-            summary = event.get("summary", "Untitled event")
-            cal     = event.get("_cal", "")
-            try:
-                time_str = datetime.fromisoformat(raw).strftime("%I:%M %p")
-            except Exception:
-                time_str = raw
-            lines.append(f"  - {time_str}: {summary} [{cal}]")
-
+        lines = [f"Schedule for {date} ({email}):"] + [_fmt_event(e) for e in all_events]
         return "\n".join(lines)
 
     except Exception as e:
         return f"Could not fetch calendar: {e}"
+
+
+# =========================================================
+# Event search
+# =========================================================
+
+def search_events(
+    query: str,
+    timezone: str = DEFAULT_TZ,
+    user_id: str | None = None,
+    calendar_filter: str = "all",
+    max_results: int = 10,
+) -> str:
+    """Search for events matching a keyword across the next 365 days.
+
+    Uses Google Calendar's built-in full-text search (title + description).
+
+    Args:
+        query:           Search term e.g. 'exam', 'COMP9900', 'dentist'.
+        timezone:        IANA timezone string.
+        user_id:         Google email — defaults to last logged-in account.
+        calendar_filter: Calendar name substring, or 'all'.
+        max_results:     Max events to return per calendar.
+    """
+    try:
+        creds, email = get_credentials(user_id)
+        service = build("calendar", "v3", credentials=creds)
+
+        tz       = pytz.timezone(timezone)
+        now      = datetime.now(tz)
+        time_min = now.isoformat()
+        time_max = (now + timedelta(days=365)).isoformat()
+
+        all_events = []
+        for cal in _get_calendars(service, calendar_filter):
+            for event in service.events().list(
+                calendarId=cal["id"],
+                q=query,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=max_results,
+            ).execute().get("items", []):
+                event["_cal"] = cal.get("summary", cal["id"])
+                all_events.append(event)
+
+        all_events = _sort_events(all_events)
+
+        if not all_events:
+            return f"No events found matching '{query}'."
+
+        lines = [f"Events matching '{query}' ({email}):"] + [_fmt_event_with_date(e) for e in all_events]
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Could not search calendar: {e}"
+
+
+# =========================================================
+# LLM intent extraction
+# =========================================================
+
+def extract_calendar_intent(text: str) -> dict:
+    """Extract date and calendar name from speech.
+
+    Returns {"date": "today|tomorrow|YYYY-MM-DD", "calendar": "name|all"}.
+    """
+    agent = Agent(
+        model="gpt-5",
+        name="whispr_calendar_intent",
+        system_prompt=(
+            "Extract date and calendar from speech. "
+            'Reply ONLY with JSON: {"date":"today|tomorrow|YYYY-MM-DD","calendar":"name|all"}. '
+            "Default date=today, calendar=all if not mentioned. No explanation."
+        ),
+    )
+    try:
+        return json.loads(str(agent.input(text)).strip())
+    except Exception:
+        return {"date": "today", "calendar": "all"}
+
+
+def extract_search_intent(text: str) -> dict:
+    """Extract search query and calendar filter from speech.
+
+    Returns {"query": "exam", "calendar": "all|name"}.
+    """
+    agent = Agent(
+        model="gpt-5",
+        name="whispr_search_intent",
+        system_prompt=(
+            "Extract a calendar search query from speech. "
+            'Reply ONLY with JSON: {"query":"search term","calendar":"name|all"}. '
+            "query = the specific thing being searched for (e.g. exam, dentist, COMP9900). "
+            "calendar = calendar name if mentioned, else all. No explanation."
+        ),
+    )
+    try:
+        return json.loads(str(agent.input(text)).strip())
+    except Exception:
+        return {"query": text.strip(), "calendar": "all"}
 
 
 # =========================================================
