@@ -241,6 +241,7 @@ def apply_dictionary_corrections(text: str) -> str:
 #  Tier 3 (~1.5s) LLM fallback     — ambiguous calendar context only
 # =========================================================
 
+
 def _load_snippet_triggers() -> List[str]:
     try:
         from snippets import load_snippets
@@ -253,61 +254,38 @@ def _load_snippet_triggers() -> List[str]:
         return []
 
 
-def _llm_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
-    agent = Agent(
-        model="gpt-5",
-        name="whispr_intent_detector",
-        system_prompt=(
-            "Classify voice input as 'text', 'calendar', or 'snippet'. "
-            "'calendar' = user REQUESTS to SEE/CHECK their schedule or events — "
-            "NOT if they are merely mentioning being busy. "
-            "'snippet' = user requests a known shortcut by name. "
-            "'text' = normal dictation. "
-            + (f"Known snippet triggers: {json.dumps(snippet_triggers)}. " if snippet_triggers else "")
-            + 'Reply ONLY with JSON: {"type":"...","trigger":null,"date":"today|tomorrow|YYYY-MM-DD","calendar":"name|all"}'
-        ),
-    )
-    try:
-        result = json.loads(_clean(agent.input(raw_text)))
-        if result.get("type") not in {"text", "calendar", "snippet"}:
-            result["type"] = "text"
-        return result
-    except Exception:
-        return {"type": "text", "trigger": None, "date": None, "calendar": None}
-
-
 def detect_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
-    text_lower = raw_text.lower()
-
-    # Tier 1: hard deny
+    """Detect intent: hard deny regex (0ms) then agent (~1.5s)."""
     if _CALENDAR_DENY.search(raw_text):
         print("[intent] deny → text", file=sys.stderr)
         return {"type": "text", "trigger": None, "date": None, "calendar": None}
 
-    # Snippet check
-    if _SNIPPET_ALLOW.search(raw_text):
-        for trigger in snippet_triggers:
-            if trigger.lower() in text_lower:
-                print(f"[intent] snippet → {trigger}", file=sys.stderr)
-                return {"type": "snippet", "trigger": trigger, "date": None, "calendar": None}
-
-    # Search: looking for a specific event by keyword
-    if _CALENDAR_SEARCH.search(raw_text):
-        print("[intent] search → calendar search", file=sys.stderr)
-        return {"type": "search", "trigger": None, "date": None, "calendar": None}
-
-    # Tier 2: hard allow
-    if _CALENDAR_ALLOW.search(raw_text):
-        print("[intent] allow → calendar", file=sys.stderr)
-        return {"type": "calendar", "trigger": None, "date": None, "calendar": None}
-
-    # Tier 3: LLM only when keywords present but ambiguous
-    if _CALENDAR_KEYWORDS.search(raw_text):
-        print("[intent] ambiguous → LLM", file=sys.stderr)
-        return _llm_intent(raw_text, snippet_triggers)
-
-    print("[intent] no signal → text", file=sys.stderr)
-    return {"type": "text", "trigger": None, "date": None, "calendar": None}
+    triggers_hint = (
+        f"Known snippet triggers: {json.dumps(snippet_triggers)}. "
+        if snippet_triggers else ""
+    )
+    agent = Agent(
+        model="gpt-5",
+        name="whispr_intent_detector",
+        system_prompt=(
+            "Classify voice input into exactly one type: text, calendar, search, or snippet.\n"
+            "calendar = user wants to SEE their schedule for a date.\n"
+            "search   = user wants to FIND a specific event by name (exam, deadline, dentist etc).\n"
+            "snippet  = user requests a known shortcut by name.\n"
+            "text     = normal dictation.\n"
+            + triggers_hint +
+            'Reply ONLY with JSON: {"type":"...","trigger":null,"date":"today|tomorrow|YYYY-MM-DD|null","calendar":"name|all|null"}'
+        ),
+    )
+    try:
+        result = json.loads(_clean(agent.input(raw_text)))
+        if result.get("type") not in {"text", "calendar", "search", "snippet"}:
+            result["type"] = "text"
+        print(f"[intent] agent → {result['type']}", file=sys.stderr)
+        return result
+    except Exception:
+        print("[intent] agent failed → text", file=sys.stderr)
+        return {"type": "text", "trigger": None, "date": None, "calendar": None}
 
 
 # =========================================================
