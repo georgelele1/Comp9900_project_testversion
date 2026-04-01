@@ -361,6 +361,40 @@ def transcribe_audio(audio_path: str) -> str:
 
 
 # =========================================================
+# Inline snippet replacement
+# Replaces trigger words found anywhere in refined text with their expansion.
+# e.g. "send the zoom link to John" → "send https://zoom.us/j/123 to John"
+# Only static snippets — dynamic (calendar) are skipped here.
+# =========================================================
+
+def apply_inline_snippets(text: str) -> str:
+    """Replace snippet triggers found inline in text with their expansion."""
+    if not text.strip():
+        return text
+    try:
+        from snippets import load_snippets, DYNAMIC_TRIGGERS
+        snippets = {
+            item["trigger"].lower(): item["expansion"]
+            for item in load_snippets().get("snippets", [])
+            if item.get("enabled", True)
+            and str(item.get("trigger", "")).strip()
+            and str(item.get("expansion", "")).strip()
+            and item["trigger"].lower() not in DYNAMIC_TRIGGERS
+        }
+        result = text
+        for trigger, expansion in snippets.items():
+            result = re.sub(
+                rf"{re.escape(trigger)}",
+                expansion,
+                result,
+                flags=re.IGNORECASE,
+            )
+        return result
+    except Exception:
+        return text
+
+
+# =========================================================
 # Core pipeline
 #
 # Agent calls per request:
@@ -442,7 +476,8 @@ def transcribe_and_enhance_impl(
 
         if intent_type == "text":
             refined    = ai_refine_text(raw_text, effective_app, target_language)
-            final_text = self_correct_text(raw_text, refined, effective_app, target_language)
+            corrected  = self_correct_text(raw_text, refined, effective_app, target_language)
+            final_text = apply_inline_snippets(corrected)
 
     except Exception as exc:
         print(f"[pipeline] error — fallback: {exc}", file=sys.stderr)
@@ -552,6 +587,39 @@ if __name__ == "__main__":
                 user_id=user_id,
                 calendar_filter=intent.get("calendar", "all"),
             )})
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            _exit_json({"output": ""}, 1)
+
+    elif command == "refine":
+        # Test refine pipeline with raw text — no audio file needed
+        # Usage: python app.py cli refine "uh so the meeting is uh tomorrow" [app_name] [language]
+        raw_text        = sys.argv[3] if len(sys.argv) > 3 else ""
+        app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
+        target_language = sys.argv[5] if len(sys.argv) > 5 else ""
+        if not raw_text:
+            _exit_json({"error": "no text provided"}, 1)
+        try:
+            snippet_triggers = _load_snippet_triggers()
+            intent           = detect_intent(raw_text, snippet_triggers)
+            intent_type      = intent.get("type", "text")
+            print(f"[test] intent={intent_type}", file=sys.stderr)
+
+            if intent_type == "search":
+                from gcalendar import search_events, extract_search_intent
+                import getpass
+                si = extract_search_intent(raw_text)
+                output = search_events(query=si.get("query") or raw_text, user_id=getpass.getuser())
+            elif intent_type == "calendar":
+                from gcalendar import get_schedule, extract_calendar_intent
+                import getpass
+                cal = extract_calendar_intent(raw_text)
+                output = get_schedule(date=cal.get("date") or "today", user_id=getpass.getuser())
+            else:
+                refined = ai_refine_text(raw_text, app_name, target_language)
+                output  = self_correct_text(raw_text, refined, app_name, target_language)
+
+            _exit_json({"input": raw_text, "intent": intent_type, "output": output})
         except Exception as e:
             print(f"ERROR: {e}", file=sys.stderr)
             _exit_json({"output": ""}, 1)
