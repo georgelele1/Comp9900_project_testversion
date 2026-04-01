@@ -46,7 +46,6 @@ APP_NAME         = "Whispr"
 SCOPES           = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/userinfo.email",
-    "openid",
 ]
 REDIRECT_URI     = "http://localhost:8765/callback"
 CREDENTIALS_FILE = Path(__file__).resolve().parent / "credentials.json"
@@ -185,7 +184,9 @@ def get_credentials(user_id: str | None = None) -> tuple[Credentials, str]:
         path = _token_path(email)
         if path.exists():
             try:
-                creds = Credentials.from_authorized_user_file(str(path), SCOPES)
+                # Load without strict scope check — token may have been saved
+                # with slightly different scopes (e.g. with/without openid)
+                creds = Credentials.from_authorized_user_file(str(path))
                 if creds and creds.expired and creds.refresh_token:
                     creds.refresh(Request())
                     path.write_text(creds.to_json(), encoding="utf-8")
@@ -417,7 +418,7 @@ if __name__ == "__main__":
             if existing:
                 path = _token_path(existing)
                 if path.exists():
-                    creds = Credentials.from_authorized_user_file(str(path), SCOPES)
+                    creds = Credentials.from_authorized_user_file(str(path))
                     if creds and creds.valid:
                         print(json.dumps({"ok": True, "email": existing}, ensure_ascii=False))
                         sys.exit(0)
