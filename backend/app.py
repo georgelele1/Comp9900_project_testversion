@@ -432,29 +432,36 @@ def transcribe_audio(audio_path: str) -> str:
 # =========================================================
 
 def apply_inline_snippets(text: str) -> str:
-    """Replace snippet triggers found inline in text with their expansion."""
+    """Replace snippet triggers found inline in text with their expansion.
+    Only static snippets — dynamic triggers (calendar) are excluded.
+    """
     if not text.strip():
         return text
     try:
-        from snippets import load_snippets, DYNAMIC_TRIGGERS
+        from snippets import load_snippets
+        dynamic = {"calendar"}
         snippets = {
             item["trigger"].lower(): item["expansion"]
             for item in load_snippets().get("snippets", [])
             if item.get("enabled", True)
             and str(item.get("trigger", "")).strip()
             and str(item.get("expansion", "")).strip()
-            and item["trigger"].lower() not in DYNAMIC_TRIGGERS
+            and item["trigger"].lower() not in dynamic
         }
+        if not snippets:
+            return text
         result = text
         for trigger, expansion in snippets.items():
             result = re.sub(
-                rf"{re.escape(trigger)}",
+                rf"\b{re.escape(trigger)}\b",
                 expansion,
                 result,
                 flags=re.IGNORECASE,
             )
+        print(f"[snippets] inline applied {len(snippets)} triggers", file=sys.stderr)
         return result
-    except Exception:
+    except Exception as e:
+        print(f"[snippets] inline error: {e}", file=sys.stderr)
         return text
 
 
