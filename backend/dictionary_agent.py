@@ -41,13 +41,31 @@ def save_dictionary(data: Dict[str, Any]) -> None:
 # =========================================================
 
 def should_update_dictionary() -> bool:
-    """True if 24h have passed since the last dictionary update."""
+    """True if update should run.
+
+    Always runs if:
+    - No timestamp exists (first run)
+    - Dictionary has no terms yet
+    - New history items exist AND 1h has passed (not 24h) when dictionary is small
+    - 24h have passed regardless
+    """
     path = storage_path("dictionary_last_update.json")
     if not path.exists():
         return True
+
+    # Always update if dictionary is empty
+    if not load_dictionary().get("terms"):
+        return True
+
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return (time.time() - data.get("last_update", 0)) > DICTIONARY_UPDATE_INTERVAL
+        data     = json.loads(path.read_text(encoding="utf-8"))
+        elapsed  = time.time() - data.get("last_update", 0)
+        # Check if there are new history items since last update
+        new_items = get_new_history_since_last_update()
+        # Update if 1h passed and there are new items, or 24h passed regardless
+        if new_items and elapsed > 3600:
+            return True
+        return elapsed > DICTIONARY_UPDATE_INTERVAL
     except Exception:
         return True
 
