@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -226,10 +227,65 @@ def approve_term(phrase: str, approved: bool = True) -> Dict[str, Any]:
 # Single agent call for all new items — avoids one call per item
 # =========================================================
 
+def _is_duplicate(phrase: str, existing: dict) -> str | None:
+    """Return existing key if phrase is a duplicate or variant, else None."""
+    p = phrase.lower().strip()
+    if p in existing:
+        return p
+    for key, term in existing.items():
+        aliases_lower = [a.lower() for a in term.get("aliases", [])]
+        if p in aliases_lower:
+            return key
+        # Normalised match — strip spaces/hyphens e.g. "front end" == "frontend"
+        p_norm   = re.sub(r"[-\s]", "", p)
+        key_norm = re.sub(r"[-\s]", "", key)
+        if p_norm == key_norm and p_norm:
+            return key
+    return None
+
+
+def deduplicate_dictionary() -> Dict[str, Any]:
+    """Scan dictionary for duplicates and merge them."""
+    dictionary = load_dictionary()
+    terms      = dictionary.get("terms", [])
+    merged     = {}
+    removed    = 0
+
+    for term in terms:
+        phrase = str(term.get("phrase", "")).strip()
+        if not phrase:
+            continue
+        key = phrase.lower()
+        dup = _is_duplicate(phrase, {k: v for k, v in merged.items() if k != key})
+        if dup:
+            existing_aliases = set(merged[dup].get("aliases", []))
+            new_aliases      = set(term.get("aliases", []))
+            if phrase.lower() != dup:
+                new_aliases.add(phrase)
+            merged[dup]["aliases"] = sorted(existing_aliases | new_aliases)
+            if term.get("confidence", 0) > merged[dup].get("confidence", 0):
+                merged[dup]["confidence"] = term["confidence"]
+            removed += 1
+        else:
+            merged[key] = term
+
+    dictionary["terms"] = list(merged.values())
+    save_dictionary(dictionary)
+    print(f"[dictionary] deduplication: {removed} duplicates merged", file=sys.stderr)
+    return {"merged": removed, "total_terms": len(dictionary["terms"])}
+
+
 def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     texts = prepare_items_for_agent(items)
     if not texts:
         return {"added": [], "updated": [], "total_terms": len(load_dictionary().get("terms", []))}
+
+    existing_terms = load_dictionary().get("terms", [])
+    existing_hint  = ", ".join('"' + t["phrase"] + '"' for t in existing_terms[:30])
+    existing_note  = (
+        f"\nExisting terms (do NOT re-add these): {existing_hint}."
+        if existing_hint else ""
+    )
 
     agent = Agent(
         model="gpt-5",
@@ -238,7 +294,10 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             "You are a dictionary term extractor for a voice transcription app. "
             "Given transcribed texts separated by '---', identify domain-specific terms, "
             "proper nouns, technical words, or project names that would benefit from a "
-            "correction dictionary. Skip common everyday words. "
+            "correction dictionary. Skip common everyday words."
+            + existing_note +
+            " If a term is a variant of an existing one (e.g. 'frontend' vs 'front end'), "
+            "add it as an alias to the existing term instead of a new entry. "
             "Return ONLY a JSON array: [{\"phrase\": \"...\", \"aliases\": [...]}]. "
             "No explanation, no markdown."
         ),
@@ -263,9 +322,9 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not phrase:
             continue
         aliases = [str(a).strip() for a in term.get("aliases", []) if str(a).strip()]
-
-        if phrase.lower() in existing:
-            e = existing[phrase.lower()]
+        dup_key = _is_duplicate(phrase, existing)
+        if dup_key:
+            e = existing[dup_key]
             e["aliases"]  = sorted(set(e.get("aliases", [])) | set(aliases))
             e["approved"] = True
             updated.append(e)
@@ -280,7 +339,8 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     dictionary["terms"] = list(existing.values())
     save_dictionary(dictionary)
-    return {"added": added, "updated": updated, "total_terms": len(dictionary["terms"])}
+    deduplicate_dictionary()
+    return {"added": added, "updated": updated, "total_terms": len(load_dictionary().get("terms", []))}
 
 
 # =========================================================
@@ -354,7 +414,12 @@ if __name__ == "__main__":
             })
 
         elif command == "list":
-            _exit_json({"output": get_dictionary()})
+            data = load_dictionary()
+            _exit_json({"terms": data.get("terms", []), "count": len(data.get("terms", []))})
+
+        elif command == "deduplicate":
+            result = deduplicate_dictionary()
+            _exit_json({"ok": True, "merged": result["merged"], "total_terms": result["total_terms"]})
 
         elif command == "add":
             phrase     = sys.argv[3] if len(sys.argv) > 3 else ""
