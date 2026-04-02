@@ -217,37 +217,101 @@ def _load_snippet_triggers() -> List[str]:
         return []
 
 
+# Tier 2: unambiguous calendar fetch
+_CALENDAR_ALLOW = re.compile(
+    r"("
+    r"(show|check|see|get|what.?s|give me|tell me|look at|open|pull up|read)"
+    r"\s+(me\s+)?(my\s+)?(schedule|calendar|events?|agenda|appointments?|meetings?)"
+    r"|what.?s\s+(on|happening)\s+(today|tomorrow|this week|next week|monday|tuesday|wednesday|thursday|friday)"
+    r"|am\s+i\s+(free|available|busy)\s+(today|tomorrow|on|this|next)"
+    r"|do\s+i\s+have\s+(anything|something|a meeting|an appointment)"
+    r"|what\s+time\s+is\s+my|when\s+is\s+my\s+next"
+    r")",
+    re.IGNORECASE,
+)
+
+# Calendar search
+_CALENDAR_SEARCH = re.compile(
+    r"(search|find|look for|when is|when.?s|what date is|what day is)"
+    r".*?(exam|test|assignment|deadline|appointment|class|lecture|meeting|event)"
+    r"|when is (my\s+)?(exam|test|assignment|deadline|appointment|class|lecture|meeting)",
+    re.IGNORECASE,
+)
+
+# Snippet: explicit action verb at start of sentence
+_SNIPPET_EXPLICIT = re.compile(
+    r"^\s*(give me|insert|paste|use|show me|open|pull up)",
+    re.IGNORECASE,
+)
+
+# Ambiguous calendar keywords — needs LLM only if none of above matched
+_CALENDAR_KEYWORDS = re.compile(
+    r"(schedule|calendar|events?|meeting|appointment|agenda|free|available|busy)",
+    re.IGNORECASE,
+)
+
+
 def detect_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
+    """3-tier intent detection:
+    Tier 1 (0ms):   Hard deny regex
+    Tier 2 (0ms):   Hard allow regex for calendar/search/snippet
+    Tier 3 (~7s):   LLM only for ambiguous calendar context
+    """
+    text_lower = raw_text.lower()
+
+    # Tier 1: deny — calendar words but NOT a request
     if _CALENDAR_DENY.search(raw_text):
         print("[intent] deny → text", file=sys.stderr)
         return {"type": "text", "trigger": None, "date": None, "calendar": None}
 
-    triggers_hint = (
-        f"Known snippet triggers: {json.dumps(snippet_triggers)}. "
-        if snippet_triggers else ""
-    )
-    agent = Agent(
-        model="gpt-5",
-        name="whispr_intent_detector",
-        system_prompt=(
-            "Classify voice input into exactly one type: text, calendar, search, or snippet.\n"
-            "calendar = user wants to SEE their schedule for a date.\n"
-            "search   = user wants to FIND a specific event by name (exam, deadline, dentist etc).\n"
-            "snippet  = user requests a known shortcut by name.\n"
-            "text     = normal dictation.\n"
-            + triggers_hint +
-            'Reply ONLY with JSON: {"type":"...","trigger":null,"date":"today|tomorrow|YYYY-MM-DD|null","calendar":"name|all|null"}'
-        ),
-    )
-    try:
-        result = json.loads(_clean(agent.input(raw_text)))
-        if result.get("type") not in {"text", "calendar", "search", "snippet"}:
-            result["type"] = "text"
-        print(f"[intent] agent → {result['type']}", file=sys.stderr)
-        return result
-    except Exception:
-        print("[intent] agent failed → text", file=sys.stderr)
-        return {"type": "text", "trigger": None, "date": None, "calendar": None}
+    # Snippet: explicit action verb + known trigger
+    if _SNIPPET_EXPLICIT.search(raw_text):
+        for trigger in snippet_triggers:
+            if trigger.lower() in text_lower:
+                print(f"[intent] snippet → {trigger}", file=sys.stderr)
+                return {"type": "snippet", "trigger": trigger, "date": None, "calendar": None}
+
+    # Calendar search
+    if _CALENDAR_SEARCH.search(raw_text):
+        print("[intent] search → calendar search", file=sys.stderr)
+        return {"type": "search", "trigger": None, "date": None, "calendar": None}
+
+    # Calendar fetch
+    if _CALENDAR_ALLOW.search(raw_text):
+        print("[intent] allow → calendar", file=sys.stderr)
+        return {"type": "calendar", "trigger": None, "date": None, "calendar": None}
+
+    # Tier 3: LLM only for ambiguous calendar keywords
+    if _CALENDAR_KEYWORDS.search(raw_text):
+        print("[intent] ambiguous → LLM", file=sys.stderr)
+        triggers_hint = (
+            f"Known snippet triggers: {json.dumps(snippet_triggers)}. "
+            if snippet_triggers else ""
+        )
+        agent = Agent(
+            model="gpt-5",
+            name="whispr_intent_detector",
+            system_prompt=(
+                "Classify voice input: text, calendar, search, or snippet.\n"
+                "calendar = user wants to SEE schedule. search = FIND specific event.\n"
+                "snippet = explicit shortcut request with action verb (give me/paste/insert).\n"
+                "text = everything else.\n"
+                + triggers_hint +
+                'Reply ONLY with JSON: {"type":"...","trigger":null,"date":"today|tomorrow|YYYY-MM-DD|null","calendar":"name|all|null"}'
+            ),
+        )
+        try:
+            result = json.loads(_clean(agent.input(raw_text)))
+            if result.get("type") not in {"text", "calendar", "search", "snippet"}:
+                result["type"] = "text"
+            print(f"[intent] LLM → {result['type']}", file=sys.stderr)
+            return result
+        except Exception:
+            pass
+
+    # Default: normal text (0ms)
+    print("[intent] text", file=sys.stderr)
+    return {"type": "text", "trigger": None, "date": None, "calendar": None}
 
 
 # =========================================================
@@ -368,29 +432,36 @@ def transcribe_audio(audio_path: str) -> str:
 # =========================================================
 
 def apply_inline_snippets(text: str) -> str:
-    """Replace snippet triggers found inline in text with their expansion."""
+    """Replace snippet triggers found inline in text with their expansion.
+    Only static snippets — dynamic triggers (calendar) are excluded.
+    """
     if not text.strip():
         return text
     try:
-        from snippets import load_snippets, DYNAMIC_TRIGGERS
+        from snippets import load_snippets
+        dynamic = {"calendar"}
         snippets = {
             item["trigger"].lower(): item["expansion"]
             for item in load_snippets().get("snippets", [])
             if item.get("enabled", True)
             and str(item.get("trigger", "")).strip()
             and str(item.get("expansion", "")).strip()
-            and item["trigger"].lower() not in DYNAMIC_TRIGGERS
+            and item["trigger"].lower() not in dynamic
         }
+        if not snippets:
+            return text
         result = text
         for trigger, expansion in snippets.items():
             result = re.sub(
-                rf"{re.escape(trigger)}",
+                rf"\b{re.escape(trigger)}\b",
                 expansion,
                 result,
                 flags=re.IGNORECASE,
             )
+        print(f"[snippets] inline applied {len(snippets)} triggers", file=sys.stderr)
         return result
-    except Exception:
+    except Exception as e:
+        print(f"[snippets] inline error: {e}", file=sys.stderr)
         return text
 
 
@@ -457,18 +528,18 @@ def transcribe_and_enhance_impl(
         elif intent_type == "snippet":
             trigger = intent.get("trigger")
             try:
-                from snippets import load_snippets, DYNAMIC_TRIGGERS, handle_dynamic_trigger
+                from snippets import load_snippets, DYNAMIC_TRIGGERS, get_calendar
                 snippets = {
                     item["trigger"]: item["expansion"]
                     for item in load_snippets().get("snippets", [])
                     if item.get("enabled", True)
                 }
                 if trigger and trigger in snippets:
-                    final_text = (
-                        handle_dynamic_trigger(trigger, raw_text)
-                        if trigger.lower() in DYNAMIC_TRIGGERS
-                        else snippets[trigger]
-                    )
+                    if trigger.lower() in DYNAMIC_TRIGGERS:
+                        # Dynamic trigger — call the tool directly
+                        final_text = get_calendar()
+                    else:
+                        final_text = snippets[trigger]
                 else:
                     intent_type = "text"
             except Exception:
@@ -616,8 +687,9 @@ if __name__ == "__main__":
                 cal = extract_calendar_intent(raw_text)
                 output = get_schedule(date=cal.get("date") or "today", user_id=getpass.getuser())
             else:
-                refined = ai_refine_text(raw_text, app_name, target_language)
-                output  = self_correct_text(raw_text, refined, app_name, target_language)
+                refined  = ai_refine_text(raw_text, app_name, target_language)
+                corrected = self_correct_text(raw_text, refined, app_name, target_language)
+                output    = apply_inline_snippets(corrected)
 
             _exit_json({"input": raw_text, "intent": intent_type, "output": output})
         except Exception as e:
