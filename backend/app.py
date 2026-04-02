@@ -432,8 +432,8 @@ def transcribe_audio(audio_path: str) -> str:
 # =========================================================
 
 def apply_inline_snippets(text: str) -> str:
-    """Replace snippet triggers found inline in text with their expansion.
-    Only static snippets — dynamic triggers (calendar) are excluded.
+    """Replace snippet triggers inline using regex — 0ms, no LLM.
+    Expansion is already formatted (e.g. "Zoom link (https://...)").
     """
     if not text.strip():
         return text
@@ -707,6 +707,11 @@ if __name__ == "__main__":
 
     elif command == "get-language":
         _exit_json({"ok": True, "language": get_target_language(), "supported": SUPPORTED_LANGUAGES})
+
+    elif command == "get-history":
+        data  = load_history()
+        items = list(reversed(data.get("items", [])))  # newest first
+        _exit_json({"items": items[:100]})  # cap at 100
 
     else:
         audio_path      = sys.argv[2]
