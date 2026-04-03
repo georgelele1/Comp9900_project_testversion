@@ -76,7 +76,7 @@ final class LocalBackendClient: ObservableObject {
         let fm = FileManager.default
         var current = URL(fileURLWithPath: fm.currentDirectoryPath)
 
-        // Walk up from current directory first
+        // Walk up from current directory firstCan you explain the redox effect in the chemical industry and give me an example?
         for _ in 0..<8 {
             let backendCandidate = current.appendingPathComponent("backend/app.py").path
             if fm.fileExists(atPath: backendCandidate) {

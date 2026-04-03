@@ -51,6 +51,39 @@ _CALENDAR_DENY = re.compile(
     re.IGNORECASE,
 )
 
+_CALENDAR_ALLOW = re.compile(
+    r"\b("
+    r"(show|check|see|get|what.?s|give me|tell me|look at|open|pull up|read)"
+    r"\s+(me\s+)?(my\s+)?(schedule|calendar|events?|agenda|appointments?|meetings?)"
+    r"|what.?s\s+(on|happening)\s+(today|tomorrow|this week|next week|monday|tuesday|wednesday|thursday|friday)"
+    r"|am\s+i\s+(free|available|busy)\s+(today|tomorrow|on|this|next)"
+    r"|do\s+i\s+have\s+(anything|something|a meeting|an appointment)"
+    r"|what\s+time\s+is\s+my|when\s+is\s+my\s+next"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CALENDAR_SEARCH = re.compile(
+    r"\b(search|find|look for|when is|when.?s|what date is|what day is)\b"
+    r".*?\b(exam|test|assignment|deadline|appointment|class|lecture|meeting|event)\b"
+    r"|when is (my\s+)?(exam|test|assignment|deadline|appointment|class|lecture|meeting)",
+    re.IGNORECASE,
+)
+
+_SNIPPET_EXPLICIT = re.compile(
+    r"^\s*(give me|insert|paste|use|show me|open|pull up)\b",
+    re.IGNORECASE,
+)
+
+_KNOWLEDGE_RE = re.compile(
+    r"\b(give me|show me|what is|what are|explain|define|tell me|"
+    r"want explanation|want to know|want to understand|"
+    r"write|list|describe|how does|how do|formula|equation|law|"
+    r"difference between|compare|what.?s the difference|"
+    r"definition|theory|concept|rule|steps|example of|meaning of)\b",
+    re.IGNORECASE,
+)
+
 
 # =========================================================
 # Storage helpers
