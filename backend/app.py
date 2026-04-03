@@ -752,7 +752,9 @@ def transcribe_and_enhance_impl(
         #    Bypasses router agent to avoid misclassification
         _KNOWLEDGE_RE = re.compile(
             r"\b(give me|show me|what is|what are|explain|define|tell me|"
+            r"want explanation|want to know|want to understand|"
             r"write|list|describe|how does|how do|formula|equation|law|"
+            r"difference between|compare|what.?s the difference|"
             r"definition|theory|concept|rule|steps|example of|meaning of)\b",
             re.IGNORECASE,
         )
