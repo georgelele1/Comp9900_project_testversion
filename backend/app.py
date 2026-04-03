@@ -697,13 +697,14 @@ def update_profile_from_history() -> None:
 # User asks for facts, formulas, definitions — agent looks them up
 # =========================================================
 
-def knowledge_lookup(text: str, app_name: str = "") -> str:
+def knowledge_lookup(text: str, app_name: str = "", target_language: str = "") -> str:
     """Look up facts, formulas, definitions — with session memory for follow-ups.
 
     Turn 1: "Newton second law"  → "F = ma"
     Turn 2: "what does each character mean" → uses memory → "F=Force, m=mass, a=acceleration"
     Turn 3: "give me an example" → uses memory → "A 10kg object..."
     """
+    lang         = target_language.strip() if target_language.strip() in SUPPORTED_LANGUAGES else get_target_language()
     user_context = get_user_context()
     context_hint = f"User context: {user_context} " if user_context else ""
     app_hint     = f"Active app: {app_name}. " if app_name and app_name != "unknown" else ""
@@ -728,6 +729,7 @@ def knowledge_lookup(text: str, app_name: str = "") -> str:
             "5. Tailor answer to active app context if relevant "
             "(e.g. if app is Xcode → favour code examples; Mail → prose explanation). "
             "6. Output ONLY the answer — no preamble ('Here is', 'Sure'). "
+            f"7. Output language: {lang}. Translate the answer to {lang} if not English. "
             f"{session_hint}"
         ),
     )
@@ -793,7 +795,7 @@ def transcribe_and_enhance_impl(
         )
         if _KNOWLEDGE_RE.search(clean_text) or is_followup(clean_text):
             print(f"[pipeline] knowledge fast-path", file=sys.stderr)
-            final_text = knowledge_lookup(clean_text, app_name=effective_app)
+            final_text = knowledge_lookup(clean_text, app_name=effective_app, target_language=target_language)
             session_remember(raw_text, final_text)
 
         # 4. Calendar/snippet fast-path using regex
@@ -904,15 +906,14 @@ def _exit_json(data: Dict[str, Any], code: int = 0) -> None:
 
 # ── Startup: build context cache + update profile once in background ──
 def _startup_init() -> None:
-    """Called once when module is imported.
+    """Called once when module is first imported as the main pipeline.
     Builds user context cache and runs profile update in background.
-    No latency impact — both run in daemon threads.
     """
-    # Pre-build context cache (fast, disk read only)
     _threading.Thread(target=get_user_context, daemon=True).start()
-    # Update learned profile once (one LLM call, background)
     _threading.Thread(target=update_profile_from_history, daemon=True).start()
 
+# Run startup when invoked directly (CLI) or imported as module
+# Lock in update_profile_from_history prevents double execution
 _startup_init()
 
 
