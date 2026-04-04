@@ -12,10 +12,28 @@ from connectonion.address import load
 from connectonion import Agent, host
 
 # Import shared storage helpers from app
-from app import (
-    app_support_dir, storage_path, load_store, save_store,
-    load_history, register_tool,
+import sys as _sys
+from pathlib import Path as _Path
+_backend_root = str(_Path(__file__).resolve().parent)
+if _backend_root not in _sys.path:
+    _sys.path.insert(0, _backend_root)
+
+from storage import (
+    app_support_dir, storage_path, load_store, save_store, load_history,
 )
+
+def register_tool(agent, fn):
+    for attr in ("add_tools", "add_tool"):
+        if hasattr(agent, attr) and callable(getattr(agent, attr)):
+            getattr(agent, attr)(fn)
+            return
+    reg = getattr(agent, "tools", None)
+    if reg is not None:
+        for meth in ("register", "add", "add_tool", "add_function", "append"):
+            m = getattr(reg, meth, None)
+            if callable(m):
+                m(fn)
+                return
 
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR   = BASE_DIR / ".co"
