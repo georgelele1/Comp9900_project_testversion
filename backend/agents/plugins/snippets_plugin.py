@@ -24,7 +24,17 @@ _EXPLICIT = re.compile(
 
 class SnippetsPlugin(WhisprPlugin):
     name        = "snippets"
-    description = "Expand user-defined voice shortcuts by trigger word"
+    description = (
+        "Expands user-defined voice shortcuts. User must explicitly request "
+        "a shortcut by name using action words like give me, paste, insert, show me. "
+        "Only triggers when the user names a known shortcut."
+    )
+    examples    = [
+        "give me my zoom link",
+        "paste my email signature",
+        "insert company website",
+        "show me my gmail",
+    ]
     priority    = 30
 
     def can_handle(self, text: str, context: dict) -> bool:
