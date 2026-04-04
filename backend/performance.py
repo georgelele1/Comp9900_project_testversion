@@ -142,7 +142,7 @@ def test_dict_agent() -> List[Dict[str, Any]]:
 
 def test_calendar_api() -> List[Dict[str, Any]]:
     print("\n── Calendar API (network) ──────────────────────────")
-    from gcalendar import extract_calendar_intent, load_current_email, _token_path, get_schedule
+    from backend.agents.plugins.Calendar import extract_calendar_intent, load_current_email, _token_path, get_schedule
     results = [
         run_timed("extract_calendar_intent", extract_calendar_intent, "show my work calendar for Friday"),
     ]
