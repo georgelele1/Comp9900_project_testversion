@@ -5,6 +5,12 @@ Handles: explicit shortcut expansion by trigger word.
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+_backend_root = str(_Path(__file__).resolve().parents[2])
+if _backend_root not in _sys.path:
+    _sys.path.insert(0, _backend_root)
+
 import re
 import sys
 
