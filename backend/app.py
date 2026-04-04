@@ -1,15 +1,37 @@
+"""
+app.py — Whispr main pipeline orchestrator.
+
+Thin entry point — all logic lives in agents/ modules:
+  agents/profile.py   — user context + profile learning
+  agents/plugins/knowledge.py — facts, formulas, definitions
+  agents/refiner.py   — text cleaning and formatting
+  agents/router.py    — intent detection and routing
+
+Other modules:
+  storage.py          — shared disk read/write helpers
+  gcalendar.py        — Google Calendar integration
+  snippets.py         — voice shortcuts
+  dictionary_agent.py — personal dictionary learning
+"""
 from __future__ import annotations
 
+import io as _io
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict
 
-# Swallow [env] line connectonion prints to stdout on import
-import io as _io
+import threading as _threading
+
+# Ensure backend root is on sys.path — required on Windows
+import sys as _sys
+from pathlib import Path as _Path
+_backend_root = str(_Path(__file__).resolve().parent)
+if _backend_root not in _sys.path:
+    _sys.path.insert(0, _backend_root)
+
 _real_stdout, _real_stderr = sys.stdout, sys.stderr
 sys.stdout = sys.stderr = _io.StringIO()
 try:
@@ -19,403 +41,23 @@ finally:
     sys.stdout = _real_stdout
     sys.stderr = _real_stderr
 
+from storage import (
+    app_support_dir, storage_path, now_ms, load_store, save_store,
+    load_profile, save_profile, load_dictionary, load_history, append_history,
+    get_target_language, set_target_language, apply_dictionary_corrections,
+    SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, APP_NAME,
+)
+from agents.profile   import get_user_context, startup_init
+from agents.refiner   import ai_refine_text, quick_clean
+from agents.router    import route, _load_snippet_triggers
+from agents.plugins.knowledge import session_remember
+
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR   = BASE_DIR / ".co"
-APP_NAME = "Whispr"
 
-PROFILE_FILE    = "profile.json"
-DICTIONARY_FILE = "dictionary.json"
-HISTORY_FILE    = "history.json"
-
-SUPPORTED_LANGUAGES = [
-    "English", "Chinese", "Spanish", "French",
-    "Japanese", "Korean", "Arabic", "German", "Portuguese",
-]
-DEFAULT_LANGUAGE = "English"
-
-ENABLE_SELF_CORRECT = False
-SCORE_THRESHOLD     = 70
-MAX_RETRIES         = 2
-
-# ── Intent deny regex (0ms) ───────────────────────────────
-# Calendar words present but clearly NOT a fetch request
-_CALENDAR_DENY = re.compile(
-    r"\b("
-    r"(my |the )?(calendar|schedule) is (full|busy|packed|crazy|hectic|clear|empty|free)"
-    r"|don.?t have time|no time for|too busy|out of time|running late"
-    r"|already (booked|scheduled|taken|busy)"
-    r"|cancel(led)? (the |my )?(meeting|appointment|event)"
-    r"|reschedule|missed (the |my )?(meeting|appointment)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-# =========================================================
-# Storage helpers
-# =========================================================
-
-def app_support_dir() -> Path:
-    home = Path.home()
-    if sys.platform == "darwin":
-        base = home / "Library" / "Application Support" / APP_NAME
-    elif os.name == "nt":
-        base = Path(os.environ.get("APPDATA", str(home))) / APP_NAME
-    else:
-        base = home / ".local" / "share" / APP_NAME
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def storage_path(filename: str) -> Path:
-    return app_support_dir() / filename
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def _write_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_store(filename: str, default: Any) -> Any:
-    return _read_json(storage_path(filename), default)
-
-
-def save_store(filename: str, data: Any) -> None:
-    _write_json(storage_path(filename), data)
-
-
-# =========================================================
-# Profile / history / dictionary
-# =========================================================
-
-def load_profile() -> Dict[str, Any]:
-    return load_store(PROFILE_FILE, {
-        "name": "", "email": "", "organization": "", "role": "",
-        "preferences": {"target_language": DEFAULT_LANGUAGE},
-    })
-
-
-def save_profile(profile: Dict[str, Any]) -> None:
-    save_store(PROFILE_FILE, profile)
-
-
-def load_dictionary() -> Dict[str, Any]:
-    return load_store(DICTIONARY_FILE, {"terms": []})
-
-
-def load_history() -> Dict[str, Any]:
-    return load_store(HISTORY_FILE, {"items": []})
-
-
-def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
-    data  = load_history()
-    items = data.get("items", [])
-    items.append(item)
-    data["items"] = items[-max_items:]
-    save_store(HISTORY_FILE, data)
-
-
-def get_target_language() -> str:
-    lang = load_profile().get("preferences", {}).get("target_language", DEFAULT_LANGUAGE)
-    return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
-
-
-def set_target_language(language: str) -> bool:
-    if language not in SUPPORTED_LANGUAGES:
-        return False
-    profile = load_profile()
-    profile.setdefault("preferences", {})["target_language"] = language
-    save_profile(profile)
-    return True
-
-
-# =========================================================
-# Common helpers
-# =========================================================
-
-def _clean(result: Any) -> str:
-    return str(result).strip().strip('"').strip("'").strip()
-
-
-def register_tool(agent: Agent, fn: Callable[..., Any]) -> None:
-    for attr in ("add_tools", "add_tool"):
-        if hasattr(agent, attr) and callable(getattr(agent, attr)):
-            getattr(agent, attr)(fn)
-            return
-    reg = getattr(agent, "tools", None)
-    if reg is not None:
-        for meth in ("register", "add", "add_tool", "add_function", "append"):
-            m = getattr(reg, meth, None)
-            if callable(m):
-                m(fn)
-                return
-    raise RuntimeError("Cannot register tool.")
-
-
-# =========================================================
-# Dictionary corrections
-# =========================================================
-
-def get_dictionary_terms() -> Dict[str, Any]:
-    """Tool: return approved dictionary terms for the refiner agent."""
-    terms = [
-        {"phrase": str(item.get("phrase", "")).strip(), "aliases": item.get("aliases", [])}
-        for item in load_dictionary().get("terms", [])
-        if item.get("approved", True) and str(item.get("phrase", "")).strip()
-    ]
-    return {"terms": terms, "count": len(terms)}
-
-
-def apply_dictionary_corrections(text: str) -> str:
-    """Fallback regex corrections — used when agent is skipped."""
-    if not text.strip():
-        return text
-    result = text
-    for item in load_dictionary().get("terms", []):
-        if not item.get("approved", True):
-            continue
-        phrase = str(item.get("phrase", "")).strip()
-        if not phrase:
-            continue
-        for alias in item.get("aliases", []):
-            alias = str(alias).strip()
-            if alias:
-                result = re.sub(
-                    rf"\b{re.escape(alias)}\b", phrase, result, flags=re.IGNORECASE
-                )
-    return result
-
-
-# =========================================================
-# Intent detection
-#
-# Tier 1 (0ms):   Hard deny regex — obvious non-calendar text
-# Tier 2 (~7s):   Agent — classifies text/calendar/search/snippet
-# =========================================================
-
-def _load_snippet_triggers() -> List[str]:
-    try:
-        from snippets import load_snippets
-        return [
-            item["trigger"]
-            for item in load_snippets().get("snippets", [])
-            if item.get("enabled", True) and str(item.get("trigger", "")).strip()
-        ]
-    except Exception:
-        return []
-
-
-# Tier 2: unambiguous calendar fetch
-_CALENDAR_ALLOW = re.compile(
-    r"("
-    r"(show|check|see|get|what.?s|give me|tell me|look at|open|pull up|read)"
-    r"\s+(me\s+)?(my\s+)?(schedule|calendar|events?|agenda|appointments?|meetings?)"
-    r"|what.?s\s+(on|happening)\s+(today|tomorrow|this week|next week|monday|tuesday|wednesday|thursday|friday)"
-    r"|am\s+i\s+(free|available|busy)\s+(today|tomorrow|on|this|next)"
-    r"|do\s+i\s+have\s+(anything|something|a meeting|an appointment)"
-    r"|what\s+time\s+is\s+my|when\s+is\s+my\s+next"
-    r")",
-    re.IGNORECASE,
-)
-
-# Calendar search
-_CALENDAR_SEARCH = re.compile(
-    r"(search|find|look for|when is|when.?s|what date is|what day is)"
-    r".*?(exam|test|assignment|deadline|appointment|class|lecture|meeting|event)"
-    r"|when is (my\s+)?(exam|test|assignment|deadline|appointment|class|lecture|meeting)",
-    re.IGNORECASE,
-)
-
-# Snippet: explicit action verb at start of sentence
-_SNIPPET_EXPLICIT = re.compile(
-    r"^\s*(give me|insert|paste|use|show me|open|pull up)",
-    re.IGNORECASE,
-)
-
-# Ambiguous calendar keywords — needs LLM only if none of above matched
-_CALENDAR_KEYWORDS = re.compile(
-    r"(schedule|calendar|events?|meeting|appointment|agenda|free|available|busy)",
-    re.IGNORECASE,
-)
-
-
-def detect_intent(raw_text: str, snippet_triggers: List[str]) -> Dict[str, Any]:
-    """3-tier intent detection:
-    Tier 1 (0ms):   Hard deny regex
-    Tier 2 (0ms):   Hard allow regex for calendar/search/snippet
-    Tier 3 (~7s):   LLM only for ambiguous calendar context
-    """
-    text_lower = raw_text.lower()
-
-    # Tier 1: deny — calendar words but NOT a request
-    if _CALENDAR_DENY.search(raw_text):
-        print("[intent] deny → text", file=sys.stderr)
-        return {"type": "text", "trigger": None, "date": None, "calendar": None}
-
-    # Snippet: explicit action verb + known trigger
-    if _SNIPPET_EXPLICIT.search(raw_text):
-        for trigger in snippet_triggers:
-            if trigger.lower() in text_lower:
-                print(f"[intent] snippet → {trigger}", file=sys.stderr)
-                return {"type": "snippet", "trigger": trigger, "date": None, "calendar": None}
-
-    # Calendar search
-    if _CALENDAR_SEARCH.search(raw_text):
-        print("[intent] search → calendar search", file=sys.stderr)
-        return {"type": "search", "trigger": None, "date": None, "calendar": None}
-
-    # Calendar fetch
-    if _CALENDAR_ALLOW.search(raw_text):
-        print("[intent] allow → calendar", file=sys.stderr)
-        return {"type": "calendar", "trigger": None, "date": None, "calendar": None}
-
-    # Tier 3: LLM only for ambiguous calendar keywords
-    if _CALENDAR_KEYWORDS.search(raw_text):
-        print("[intent] ambiguous → LLM", file=sys.stderr)
-        triggers_hint = (
-            f"Known snippet triggers: {json.dumps(snippet_triggers)}. "
-            if snippet_triggers else ""
-        )
-        agent = Agent(
-            model="gpt-5",
-            name="whispr_intent_detector",
-            system_prompt=(
-                "Classify voice input: text, calendar, search, or snippet.\n"
-                "calendar = user wants to SEE schedule. search = FIND specific event.\n"
-                "snippet = explicit shortcut request with action verb (give me/paste/insert).\n"
-                "text = everything else.\n"
-                + triggers_hint +
-                'Reply ONLY with JSON: {"type":"...","trigger":null,"date":"today|tomorrow|YYYY-MM-DD|null","calendar":"name|all|null"}'
-            ),
-        )
-        try:
-            result = json.loads(_clean(agent.input(raw_text)))
-            if result.get("type") not in {"text", "calendar", "search", "snippet"}:
-                result["type"] = "text"
-            print(f"[intent] LLM → {result['type']}", file=sys.stderr)
-            return result
-        except Exception:
-            pass
-
-    # Default: normal text (0ms)
-    print("[intent] text", file=sys.stderr)
-    return {"type": "text", "trigger": None, "date": None, "calendar": None}
-
-
-# =========================================================
-# AI refine
-# =========================================================
-
-def ai_refine_text(
-    text: str,
-    app_name: str = "",
-    target_language: str = "",
-) -> str:
-    if not text.strip():
-        return text
-
-    lang = target_language.strip()
-    if not lang or lang not in SUPPORTED_LANGUAGES:
-        lang = get_target_language()
-
-    # Skip LLM for short clean English text
-    if (lang == "English"
-            and len(text.split()) < 5
-            and not re.search(r"\b(uh|um|er|so so|I I|the the)\b", text, re.IGNORECASE)):
-        return apply_dictionary_corrections(text)
-
-    app_hint = (
-        f"Active app: {app_name.strip()}. "
-        if app_name.strip() and app_name.strip() != "unknown"
-        else ""
-    )
-    translate_step = f"4. Translate to {lang} if needed." if lang != "English" else ""
-
-    # Only inject dictionary tool if terms exist — skips extra LLM call when empty
-    has_dictionary = bool(load_dictionary().get("terms"))
-    dict_step      = "1. Call get_dictionary_terms and apply corrections. " if has_dictionary else ""
-    step_offset    = 2 if has_dictionary else 1
-
-    agent = Agent(
-        model="gpt-5",
-        name="whispr_text_refiner",
-        system_prompt=(
-            "You are a voice transcription cleaner. "
-            f"{app_hint}"
-            f"Output language: {lang}. "
-            f"{dict_step}"
-            f"{step_offset}. Remove stutters, false starts, filler words (uh, um, like), repeated words. "
-            f"{step_offset+1}. Fix punctuation and capitalisation. "
-            f"{translate_step} "
-            "Output ONLY the final cleaned text."
-        ),
-    )
-    if has_dictionary:
-        register_tool(agent, get_dictionary_terms)
-
-    return _clean(agent.input(text))
-
-
-# =========================================================
-# Self-correction  (disabled in hot path)
-# =========================================================
-
-def self_correct_text(
-    raw_text: str,
-    refined: str,
-    app_name: str = "",
-    target_language: str = "",
-) -> str:
-    if not ENABLE_SELF_CORRECT:
-        return refined
-    try:
-        from Eval_run import run_refinement_eval
-    except ImportError:
-        return refined
-
-    current    = refined
-    best       = refined
-    best_score = 0
-    lang       = target_language.strip() or get_target_language()
-
-    for attempt in range(MAX_RETRIES):
-        results = run_refinement_eval([{
-            "raw_text": raw_text, "final_text": current, "app_name": app_name,
-        }], verbose=False)
-        if not results:
-            break
-        score, reason = results[0]["score"], results[0]["reason"]
-        if score > best_score:
-            best_score, best = score, current
-        print(f"[self-correct] attempt {attempt+1} score={score}/100", file=sys.stderr)
-        if score >= SCORE_THRESHOLD:
-            break
-        current = _clean(Agent(
-            model="gpt-5", name="whispr_self_corrector",
-            system_prompt=f"Fix issues. Output ONLY corrected {lang} text.",
-        ).input(f"Raw: {raw_text}\nPrevious: {current}\nFeedback: {reason}"))
-
-    return best
-
-
-# =========================================================
-# Transcribe helper
-# =========================================================
 
 def transcribe_audio(audio_path: str) -> str:
-    """Transcribe audio and strip connectonion wrapper preamble."""
+    import re
     raw = str(transcribe(audio_path)).strip()
     raw = re.sub(
         r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:]*:\s*",
@@ -424,22 +66,13 @@ def transcribe_audio(audio_path: str) -> str:
     return raw
 
 
-# =========================================================
-# Inline snippet replacement
-# Replaces trigger words found anywhere in refined text with their expansion.
-# e.g. "send the zoom link to John" → "send https://zoom.us/j/123 to John"
-# Only static snippets — dynamic (calendar) are skipped here.
-# =========================================================
-
 def apply_inline_snippets(text: str) -> str:
-    """Replace snippet triggers inline using regex — 0ms, no LLM.
-    Expansion is already formatted (e.g. "Zoom link (https://...)").
-    """
+    import re
     if not text.strip():
         return text
     try:
         from snippets import load_snippets
-        dynamic = {"calendar"}
+        dynamic  = {"calendar"}
         snippets = {
             item["trigger"].lower(): item["expansion"]
             for item in load_snippets().get("snippets", [])
@@ -452,103 +85,65 @@ def apply_inline_snippets(text: str) -> str:
             return text
         result = text
         for trigger, expansion in snippets.items():
-            result = re.sub(
-                rf"\b{re.escape(trigger)}\b",
-                expansion,
-                result,
-                flags=re.IGNORECASE,
-            )
-        print(f"[snippets] inline applied {len(snippets)} triggers", file=sys.stderr)
+            result = re.sub(rf"\b{re.escape(trigger)}\b", expansion, result, flags=re.IGNORECASE)
         return result
     except Exception as e:
         print(f"[snippets] inline error: {e}", file=sys.stderr)
         return text
 
 
-# =========================================================
-# Core pipeline
-#
-# Agent calls per request:
-#   text:              intent (~7s) + refine (~8s) = ~15s
-#   calendar/search:   intent (~7s) + API (~3s)    = ~10s
-#   snippet:           intent (~7s) + local (0ms)  = ~7s
-# =========================================================
-
 def transcribe_and_enhance_impl(
-    audio_path: str,
-    app_name: str = "",
-    target_language: str = "",
+    audio_path         : str,
+    app_name           : str = "",
+    target_language    : str = "",
+    _raw_text_override : str = "",
 ) -> Dict[str, Any]:
-
-    audio_path = str(Path(audio_path).expanduser())
-    if not Path(audio_path).exists():
-        return {"ok": False, "error": f"audio file not found: {audio_path}", "ts": now_ms()}
 
     t0 = time.perf_counter()
 
-    # 1. Transcribe
-    raw_text = transcribe_audio(audio_path)
-    t1 = time.perf_counter()
-    print(f"[pipeline] transcribe {(t1-t0)*1000:.0f}ms  {raw_text[:60]!r}", file=sys.stderr)
+    if _raw_text_override:
+        raw_text = _raw_text_override
+        print(f"[pipeline] text override: {raw_text[:60]!r}", file=sys.stderr)
+    else:
+        audio_path = str(Path(audio_path).expanduser())
+        if not Path(audio_path).exists():
+            return {"ok": False, "error": f"audio file not found: {audio_path}", "ts": now_ms()}
+        raw_text = transcribe_audio(audio_path)
+        print(f"[pipeline] transcribe {(time.perf_counter()-t0)*1000:.0f}ms  {raw_text[:60]!r}", file=sys.stderr)
 
     if not raw_text.strip():
         return {"ok": False, "error": "transcription returned empty", "ts": now_ms()}
 
     effective_app    = app_name.strip() or "unknown"
     snippet_triggers = _load_snippet_triggers()
+    user_context     = get_user_context()
     final_text       = raw_text
 
     try:
-        # 2. Detect intent
-        intent      = detect_intent(raw_text, snippet_triggers)
-        intent_type = intent.get("type", "text")
-        print(f"[pipeline] intent={intent_type} {(time.perf_counter()-t1)*1000:.0f}ms", file=sys.stderr)
+        clean_text = quick_clean(raw_text)
+        print(f"[pipeline] pre-clean: {clean_text[:60]!r}", file=sys.stderr)
 
-        # 3. Route
-        if intent_type == "search":
-            from gcalendar import search_events, extract_search_intent
-            import getpass
-            si = extract_search_intent(raw_text)
-            final_text = search_events(
-                query=si.get("query") or raw_text,
-                user_id=getpass.getuser(),
-                calendar_filter=si.get("calendar") or "all",
+        result = route(
+            raw_text        = raw_text,
+            clean_text      = clean_text,
+            snippet_triggers= snippet_triggers,
+            app_name        = app_name,
+            target_language = target_language,
+            user_context    = user_context,
+            effective_app   = effective_app,
+        )
+
+        if result is not None:
+            final_text = result
+        else:
+            refined    = ai_refine_text(
+                raw_text,
+                app_name        = effective_app,
+                target_language = target_language,
+                user_context    = user_context,
             )
-
-        elif intent_type == "calendar":
-            from gcalendar import get_schedule, extract_calendar_intent
-            import getpass
-            cal = extract_calendar_intent(raw_text)
-            final_text = get_schedule(
-                date=cal.get("date") or "today",
-                user_id=getpass.getuser(),
-                calendar_filter=cal.get("calendar") or "all",
-            )
-
-        elif intent_type == "snippet":
-            trigger = intent.get("trigger")
-            try:
-                from snippets import load_snippets, DYNAMIC_TRIGGERS, get_calendar
-                snippets = {
-                    item["trigger"]: item["expansion"]
-                    for item in load_snippets().get("snippets", [])
-                    if item.get("enabled", True)
-                }
-                if trigger and trigger in snippets:
-                    if trigger.lower() in DYNAMIC_TRIGGERS:
-                        # Dynamic trigger — call the tool directly
-                        final_text = get_calendar()
-                    else:
-                        final_text = snippets[trigger]
-                else:
-                    intent_type = "text"
-            except Exception:
-                intent_type = "text"
-
-        if intent_type == "text":
-            refined    = ai_refine_text(raw_text, effective_app, target_language)
-            corrected  = self_correct_text(raw_text, refined, effective_app, target_language)
-            final_text = apply_inline_snippets(corrected)
+            final_text = apply_inline_snippets(refined)
+            session_remember(raw_text, final_text)
 
     except Exception as exc:
         print(f"[pipeline] error — fallback: {exc}", file=sys.stderr)
@@ -558,7 +153,7 @@ def transcribe_and_enhance_impl(
 
     append_history({
         "ts":              now_ms(),
-        "audio_path":      audio_path,
+        "audio_path":      audio_path if not _raw_text_override else "",
         "raw_text":        raw_text,
         "final_text":      final_text,
         "app_name":        effective_app,
@@ -568,15 +163,7 @@ def transcribe_and_enhance_impl(
     return {"ok": True, "raw_text": raw_text, "final_text": final_text, "ts": now_ms()}
 
 
-# =========================================================
-# Agent tool functions
-# =========================================================
-
-def create_or_update_profile(
-    name: str = "", email: str = "",
-    organization: str = "", role: str = "",
-    target_language: str = "",
-) -> Dict[str, Any]:
+def create_or_update_profile(name="", email="", organization="", role="", target_language=""):
     profile = load_profile()
     for key, val in {"name": name, "email": email, "organization": organization, "role": role}.items():
         if str(val).strip():
@@ -587,38 +174,33 @@ def create_or_update_profile(
     return {"ok": True, "profile": profile}
 
 
-def get_profile() -> Dict[str, Any]:
+def get_profile():
     return {"ok": True, "profile": load_profile()}
 
 
-def transcribe_and_enhance(
-    audio_path: str, app_name: str = "", target_language: str = "",
-) -> Dict[str, Any]:
-    return transcribe_and_enhance_impl(
-        audio_path=audio_path, app_name=app_name, target_language=target_language,
-    )
+def transcribe_and_enhance(audio_path, app_name="", target_language=""):
+    return transcribe_and_enhance_impl(audio_path=audio_path, app_name=app_name, target_language=target_language)
 
 
-# =========================================================
-# Agent factory
-# =========================================================
+def _register_tool(agent, fn):
+    for attr in ("add_tools", "add_tool"):
+        if hasattr(agent, attr) and callable(getattr(agent, attr)):
+            getattr(agent, attr)(fn)
+            return
 
-def create_agent() -> Agent:
-    agent = Agent(
-        model="gpt-5",
-        name="whispr_orchestrator",
-        system_prompt="You are Whispr. You orchestrate audio transcription and refinement.",
-    )
+
+def create_agent():
+    agent = Agent(model="gpt-5", name="whispr_orchestrator",
+                  system_prompt="You are Whispr. You orchestrate audio transcription and refinement.")
     for fn in (create_or_update_profile, get_profile, transcribe_and_enhance):
-        register_tool(agent, fn)
+        _register_tool(agent, fn)
     return agent
 
 
-# =========================================================
-# CLI / host
-# =========================================================
+startup_init()
 
-def _exit_json(data: Dict[str, Any], code: int = 0) -> None:
+
+def _exit_json(data, code=0):
     print(json.dumps(data, ensure_ascii=False))
     sys.exit(code)
 
@@ -646,6 +228,19 @@ if __name__ == "__main__":
             print(f"ERROR: {e}", file=sys.stderr)
             _exit_json({"output": ""}, 1)
 
+    elif command == "refine":
+        raw_text        = sys.argv[3] if len(sys.argv) > 3 else ""
+        app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
+        target_language = sys.argv[5] if len(sys.argv) > 5 else ""
+        if not raw_text:
+            _exit_json({"error": "no text provided"}, 1)
+        try:
+            result = transcribe_and_enhance_impl("", app_name, target_language, _raw_text_override=raw_text)
+            _exit_json({"input": raw_text, "intent": "agent", "output": result.get("final_text", "")})
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            _exit_json({"output": ""}, 1)
+
     elif command == "calendar":
         import getpass
         text    = sys.argv[3] if len(sys.argv) > 3 else "today"
@@ -653,45 +248,7 @@ if __name__ == "__main__":
         try:
             from gcalendar import get_schedule, extract_calendar_intent
             intent = extract_calendar_intent(text)
-            _exit_json({"output": get_schedule(
-                date=intent.get("date", "today"),
-                user_id=user_id,
-                calendar_filter=intent.get("calendar", "all"),
-            )})
-        except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            _exit_json({"output": ""}, 1)
-
-    elif command == "refine":
-        # Test refine pipeline with raw text — no audio file needed
-        # Usage: python app.py cli refine "uh so the meeting is uh tomorrow" [app_name] [language]
-        raw_text        = sys.argv[3] if len(sys.argv) > 3 else ""
-        app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
-        target_language = sys.argv[5] if len(sys.argv) > 5 else ""
-        if not raw_text:
-            _exit_json({"error": "no text provided"}, 1)
-        try:
-            snippet_triggers = _load_snippet_triggers()
-            intent           = detect_intent(raw_text, snippet_triggers)
-            intent_type      = intent.get("type", "text")
-            print(f"[test] intent={intent_type}", file=sys.stderr)
-
-            if intent_type == "search":
-                from gcalendar import search_events, extract_search_intent
-                import getpass
-                si = extract_search_intent(raw_text)
-                output = search_events(query=si.get("query") or raw_text, user_id=getpass.getuser())
-            elif intent_type == "calendar":
-                from gcalendar import get_schedule, extract_calendar_intent
-                import getpass
-                cal = extract_calendar_intent(raw_text)
-                output = get_schedule(date=cal.get("date") or "today", user_id=getpass.getuser())
-            else:
-                refined  = ai_refine_text(raw_text, app_name, target_language)
-                corrected = self_correct_text(raw_text, refined, app_name, target_language)
-                output    = apply_inline_snippets(corrected)
-
-            _exit_json({"input": raw_text, "intent": intent_type, "output": output})
+            _exit_json({"output": get_schedule(date=intent.get("date", "today"), user_id=user_id, calendar_filter=intent.get("calendar", "all"))})
         except Exception as e:
             print(f"ERROR: {e}", file=sys.stderr)
             _exit_json({"output": ""}, 1)
@@ -699,19 +256,15 @@ if __name__ == "__main__":
     elif command == "set-language":
         language = sys.argv[3] if len(sys.argv) > 3 else ""
         ok = set_target_language(language)
-        _exit_json({
-            "ok": ok, "language": language,
-            "error": f"unsupported: {language}" if not ok else None,
-            "supported": SUPPORTED_LANGUAGES,
-        }, 0 if ok else 1)
+        _exit_json({"ok": ok, "language": language, "error": f"unsupported: {language}" if not ok else None, "supported": SUPPORTED_LANGUAGES}, 0 if ok else 1)
 
     elif command == "get-language":
         _exit_json({"ok": True, "language": get_target_language(), "supported": SUPPORTED_LANGUAGES})
 
     elif command == "get-history":
         data  = load_history()
-        items = list(reversed(data.get("items", [])))  # newest first
-        _exit_json({"items": items[:100]})  # cap at 100
+        items = list(reversed(data.get("items", [])))
+        _exit_json({"items": items[:100]})
 
     else:
         audio_path      = sys.argv[2]
