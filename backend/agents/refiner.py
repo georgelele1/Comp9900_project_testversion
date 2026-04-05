@@ -162,9 +162,12 @@ def ai_refine_text(
         if lang != "English" else ""
     )
 
-    has_dict  = bool(load_dictionary().get("terms"))
-    dict_step = "1. Call get_dictionary_terms and apply corrections. " if has_dict else ""
-    offset    = 2 if has_dict else 1
+    # Skip dictionary tool — quick_clean already applied regex corrections before routing.
+    # Only use tool for longer texts where context-aware correction matters.
+    word_count = len(text.split())
+    has_dict   = bool(load_dictionary().get("terms")) and word_count > 15
+    dict_step  = "1. Call get_dictionary_terms and apply corrections. " if has_dict else ""
+    offset     = 2 if has_dict else 1
 
     agent = Agent(
         model="gpt-5",
@@ -174,14 +177,20 @@ def ai_refine_text(
             f"{ctx_hint}{app_fmt}"
             f"Output language: {lang}. "
             f"{dict_step}"
-            f"{offset}. Fix phonetic mishearings using context. "
-            f"{offset+1}. Remove stutters, false starts, fillers "
-            "(uh, um, like, so, basically, actually, you know), "
-            "interjections (ah, oh, hmm). "
-            f"{offset+2}. Detect numbered list (point one/two, first/second) "
-            "→ format as numbered list. Otherwise prose. "
-            f"{offset+3}. Fix punctuation and capitalisation. "
-            f"{trans} Output ONLY the final text."
+            f"{offset}. Fix phonetic mishearings using context and user profile. "
+            f"{offset+1}. Remove ALL stutters, false starts, repeated words, "
+            "filler words (uh, um, like, so, basically, actually, you know, right, okay so), "
+            "interjections (ah, oh, hmm, yeah, well). "
+            f"{offset+2}. Detect numbered list (point one/two, first/second/third, number one/two) "
+            "→ format as numbered list, one item per line. Otherwise prose. "
+            f"{offset+3}. Apply app-specific formatting strictly: "
+            "If Mail/email app → structure as complete email with Subject:, greeting, body, sign-off. "
+            "If code editor → use technical language, preserve code terms. "
+            "If chat app → keep concise and conversational. "
+            "If document editor → use clear paragraphs and proper structure. "
+            f"{offset+4}. Fix punctuation and capitalisation. "
+            f"{trans} "
+            "Output ONLY the final formatted text. No explanation."
         ),
     )
     if has_dict:
