@@ -384,51 +384,50 @@ struct SidebarView: View {
         switch action {
         case .history:
             clearingHistory = .running
-            backendClient.clearHistory { ok in
+            backendClient.clearHistory { [self] ok in
                 clearingHistory = ok ? .done : .failed
-                resetState(&clearingHistory)
+                scheduleClearReset { self.clearingHistory = .idle }
             }
         case .dictionary:
             clearingDictionary = .running
-            backendClient.clearDictionary { ok in
+            backendClient.clearDictionary { [self] ok in
                 clearingDictionary = ok ? .done : .failed
-                resetState(&clearingDictionary)
+                scheduleClearReset { self.clearingDictionary = .idle }
             }
         case .snippets:
             clearingSnippets = .running
-            backendClient.clearSnippets { ok in
+            backendClient.clearSnippets { [self] ok in
                 clearingSnippets = ok ? .done : .failed
-                resetState(&clearingSnippets)
+                scheduleClearReset { self.clearingSnippets = .idle }
             }
         case .profile:
             resettingProfile = .running
-            backendClient.resetProfile { ok in
+            backendClient.resetProfile { [self] ok in
                 resettingProfile = ok ? .done : .failed
-                resetState(&resettingProfile)
+                scheduleClearReset { self.resettingProfile = .idle }
             }
         case .all:
             clearingHistory    = .running
             clearingDictionary = .running
             clearingSnippets   = .running
             resettingProfile   = .running
-            backendClient.resetAll { ok in
-                let state: ClearState = ok ? .done : .failed
-                clearingHistory    = state
-                clearingDictionary = state
-                clearingSnippets   = state
-                resettingProfile   = state
-                resetState(&clearingHistory)
-                resetState(&clearingDictionary)
-                resetState(&clearingSnippets)
-                resetState(&resettingProfile)
+            backendClient.resetAll { [self] ok in
+                let s: ClearState = ok ? .done : .failed
+                clearingHistory    = s
+                clearingDictionary = s
+                clearingSnippets   = s
+                resettingProfile   = s
+                scheduleClearReset { self.clearingHistory    = .idle }
+                scheduleClearReset { self.clearingDictionary = .idle }
+                scheduleClearReset { self.clearingSnippets   = .idle }
+                scheduleClearReset { self.resettingProfile   = .idle }
             }
         }
     }
 
-    private func resetState(_ state: inout ClearState) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            if state == .done || state == .failed { state = .idle }
-        }
+    /// Resets a state back to idle after 3 s — avoids inout in escaping closure.
+    private func scheduleClearReset(_ reset: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: reset)
     }
 }
 
