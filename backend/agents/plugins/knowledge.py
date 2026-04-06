@@ -118,7 +118,9 @@ class KnowledgePlugin(WhisprPlugin):
                 "3. Steps/processes → numbered list.\n"
                 "4. Definitions → concise and domain-specific.\n"
                 "5. Tailor to active app (Xcode→code; Mail→prose).\n"
-                "6. No preamble ('Here is', 'Sure').\n"
+                "6. CRITICAL — no preamble ever: never start with 'Here is', 'Sure', "
+                "'Here\\'s the', 'This is the', 'Transcription:', 'Output:', or any introduction. "
+                "Your first word must be the first word of the actual answer.\n"
                 f"7. {lang_hint}"
                 f"{session_hint}"
             ),
