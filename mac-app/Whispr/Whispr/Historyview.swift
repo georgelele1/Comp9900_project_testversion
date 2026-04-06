@@ -22,6 +22,7 @@ struct HistoryView: View {
     @State private var entries      : [HistoryEntry] = []
     @State private var searchText   : String = ""
     @State private var isLoading    : Bool   = false
+    @State private var confirmClear : Bool   = false
     @State private var selectedID   : UUID?  = nil
 
     var backendClient: LocalBackendClient?
@@ -57,6 +58,27 @@ struct HistoryView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Refresh")
+
+                Button {
+                    confirmClear = true
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Clear all history")
+                .alert("Clear History", isPresented: $confirmClear) {
+                    Button("Clear All", role: .destructive) {
+                        backendClient?.clearHistory { success in
+                            DispatchQueue.main.async {
+                                if success { entries = []; selectedID = nil }
+                            }
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This will permanently delete all transcription history.")
+                }
             }
             .padding()
 

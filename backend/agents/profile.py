@@ -7,6 +7,12 @@ Provides get_user_context() which returns the cached string in 0ms.
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+_backend_root = str(_Path(__file__).resolve().parents[2])
+if _backend_root not in _sys.path:
+    _sys.path.insert(0, _backend_root)
+
 import io as _io
 import sys
 import threading
@@ -88,6 +94,8 @@ def _build_user_context() -> str:
     if lang and lang != "English":
         parts.append(f"Output language: {lang}.")
 
+    # Auto-learned description — generated from usage history
+    # Merged with manual fields: adds behavioural context the user didn't manually specify
     description = learned.get("description", "").strip()
     if description:
         parts.append(description)

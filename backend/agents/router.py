@@ -62,12 +62,14 @@ def route(
     """
     from agents.plugins import find_plugin
 
+    from agents.plugins.knowledge import session_context
     context = {
         "raw_text":         raw_text,
         "app_name":         effective_app or app_name,
         "target_language":  target_language,
         "user_context":     user_context,
         "snippet_triggers": snippet_triggers,
+        "session":          session_context(),
     }
 
     plugin = find_plugin(clean_text, context)
