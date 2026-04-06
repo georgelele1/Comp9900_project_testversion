@@ -79,15 +79,42 @@ def save_store(filename: str, data: Any) -> None:
 # Profile
 # =========================================================
 
-def load_profile() -> Dict[str, Any]:
-    return load_store(PROFILE_FILE, {
-        "name": "", "email": "", "organization": "", "role": "",
+def _default_profile() -> Dict[str, Any]:
+    return {
+        # ── User habits (set during onboarding) ───────────
+        "career_area":   "",    # e.g. "Software / Tech", "Medicine"
+        "usage_type":    [],    # e.g. ["Draft an email", "Code comments"]
+        "writing_style": "",    # "casual" | "formal" | "technical"
+        "onboarding_done": False,
+
+        # ── Text insertion shortcuts ───────────────────────
+        "text_insertions": [],  # [{"label": "Work email", "value": "me@co.com"}]
+
+        # ── App preferences ────────────────────────────────
         "preferences": {"target_language": DEFAULT_LANGUAGE},
+
+        # ── AI-learned context (auto-updated from history) ─
         "learned": {
-            "description":  "",
-            "last_updated": 0,
-        }
-    })
+            "description":      "",   # free-text summary written by LLM
+            "habits":           [],   # recurring phrases / topics noticed
+            "frequent_apps":    [],   # apps seen most often in transcriptions
+            "last_updated":     0,
+        },
+    }
+
+
+def load_profile() -> Dict[str, Any]:
+    stored = load_store(PROFILE_FILE, _default_profile())
+    # Back-fill any keys added after first install so old profiles stay valid
+    defaults = _default_profile()
+    changed  = False
+    for key, val in defaults.items():
+        if key not in stored:
+            stored[key] = val
+            changed = True
+    if changed:
+        save_store(PROFILE_FILE, stored)
+    return stored
 
 
 def save_profile(profile: Dict[str, Any]) -> None:
@@ -150,3 +177,41 @@ def append_history(item: Dict[str, Any], max_items: int = 200) -> None:
     items.append(item)
     data["items"] = items[-max_items:]
     save_store(HISTORY_FILE, data)
+
+# =========================================================
+# Text insertions — saved auto-fill values
+# =========================================================
+
+def load_text_insertions() -> list:
+    return load_profile().get("text_insertions", [])
+
+
+def save_text_insertion(label: str, value: str) -> bool:
+    label = str(label or "").strip()
+    value = str(value or "").strip()
+    if not label or not value:
+        return False
+    profile = load_profile()
+    insertions = profile.setdefault("text_insertions", [])
+    for item in insertions:
+        if item.get("label", "").lower() == label.lower():
+            item["value"] = value
+            save_profile(profile)
+            return True
+    insertions.append({"label": label, "value": value})
+    save_profile(profile)
+    return True
+
+
+def remove_text_insertion(label: str) -> bool:
+    label = str(label or "").strip()
+    profile = load_profile()
+    before = len(profile.get("text_insertions", []))
+    profile["text_insertions"] = [
+        i for i in profile.get("text_insertions", [])
+        if i.get("label", "").lower() != label.lower()
+    ]
+    if len(profile["text_insertions"]) < before:
+        save_profile(profile)
+        return True
+    return False
