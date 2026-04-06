@@ -110,13 +110,21 @@ def _build_user_context() -> str:
         if labels:
             parts.append(f"Text insertion shortcuts: {'; '.join(labels)}.")
 
-    recent = [
-        str(i.get("final_text", ""))[:80]
-        for i in load_history().get("items", [])[-5:]
-        if str(i.get("final_text", "")).strip()
-    ]
-    if recent:
-        parts.append(f"Recent dictations: {' | '.join(recent)}.")
+    # Use raw_text (what user said) not final_text (which includes
+    # plugin responses, calendar data, knowledge answers etc.)
+    _SKIP = {"i can help", "no google calendar", "could not fetch", "schedule for"}
+    recent_raw = []
+    for item in reversed(load_history().get("items", [])[-20:]):
+        raw = str(item.get("raw_text", "")).strip()
+        if not raw or len(raw.split()) < 3:
+            continue
+        if any(s in raw.lower() for s in _SKIP):
+            continue
+        recent_raw.append(raw[:80])
+        if len(recent_raw) >= 5:
+            break
+    if recent_raw:
+        parts.append(f"Recent speech: {' | '.join(recent_raw)}.")
 
     return " ".join(parts)
 
@@ -154,8 +162,13 @@ def update_profile_from_history() -> None:
         _PROFILE_UPDATED = True
     try:
         items = load_history().get("items", [])[-50:]
-        texts = [str(i.get("final_text", "")).strip() for i in items
-                 if str(i.get("final_text", "")).strip()]
+        # Use raw_text so the LLM learns from what user said, not plugin output
+        texts = [
+            str(i.get("raw_text", "") or i.get("final_text", "")).strip()
+            for i in items
+            if len(str(i.get("raw_text", "") or i.get("final_text", "")).split()) >= 3
+        ]
+        texts = [t for t in texts if t]
         if len(texts) < 5:
             return
 
@@ -174,6 +187,7 @@ def update_profile_from_history() -> None:
             '"frequent_apps": ["app name", ...]}'  
         )
 
+        # Structured JSON extraction — fast model is sufficient
         agent = Agent(
             model="gpt-5.4",
             name="whispr_profile_learner",
