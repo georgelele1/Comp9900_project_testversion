@@ -51,7 +51,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+
+        // Show onboarding on first launch
+        AppManager.shared.localBackendClient.isFirstLaunch { isFirst in
+            if isFirst {
+                self.showOnboarding()
+            }
+        }
     }
+
+    private func showOnboarding() {
+        let host = NSHostingController(rootView: OnboardingView {
+            self.onboardingWindow?.close()
+            self.onboardingWindow = nil
+        })
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 700),
+            styleMask:   [.titled, .closable, .fullSizeContentView],
+            backing:     .buffered,
+            defer:       false
+        )
+        win.title                       = "Welcome to Whispr"
+        win.contentViewController       = host
+        win.titlebarAppearsTransparent  = true
+        win.isMovableByWindowBackground = true
+        win.isReleasedWhenClosed        = false
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        onboardingWindow = win
+    }
+
+    private var onboardingWindow: NSWindow?
 
     func applicationWillTerminate(_ notification: Notification) {
         AppManager.shared.audioRecorder.stopRecording()

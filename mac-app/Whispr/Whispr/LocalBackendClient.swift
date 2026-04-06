@@ -632,4 +632,64 @@ final class LocalBackendClient: ObservableObject {
             if case .success = result { completion(true) } else { completion(false) }
         }
     }
+
+    // =========================================================
+    // Onboarding & profile
+    // =========================================================
+
+    func isFirstLaunch(completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "is-first-launch"]) { result in
+            guard case .success(let output) = result,
+                  let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let first = json["first_launch"] as? Bool
+            else { completion(false); return }
+            completion(first)
+        }
+    }
+
+    func saveOnboardingProfile(_ profile: [String: Any], completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath,
+              let jsonData = try? JSONSerialization.data(withJSONObject: profile),
+              let jsonStr  = String(data: jsonData, encoding: .utf8)
+        else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "save-profile", jsonStr]) { result in
+            if case .success = result { completion(true) } else { completion(false) }
+        }
+    }
+
+    // =========================================================
+    // Text insertions
+    // =========================================================
+
+    func listTextInsertions(completion: @escaping ([[String: Any]]) -> Void) {
+        guard let backendScriptPath else { completion([]); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "list-insertions"]) { result in
+            guard case .success(let output) = result else { completion([]); return }
+            for line in output.components(separatedBy: .newlines) {
+                guard let data  = line.data(using: .utf8),
+                      let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let items = json["insertions"] as? [[String: Any]]
+                else { continue }
+                completion(items)
+                return
+            }
+            completion([])
+        }
+    }
+
+    func saveTextInsertion(label: String, value: String, completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "save-insertion", label, value]) { result in
+            if case .success = result { completion(true) } else { completion(false) }
+        }
+    }
+
+    func removeTextInsertion(label: String, completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "remove-insertion", label]) { result in
+            if case .success = result { completion(true) } else { completion(false) }
+        }
+    }
 }
