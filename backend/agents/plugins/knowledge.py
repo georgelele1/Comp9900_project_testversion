@@ -105,7 +105,7 @@ class KnowledgePlugin(WhisprPlugin):
         )
 
         agent = Agent(
-            model="gpt-5",
+            model="gpt-5.4",
             name="whispr_knowledge_agent",
             system_prompt=(
                 "You are a universal knowledge assistant. "

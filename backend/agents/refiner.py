@@ -170,7 +170,7 @@ def ai_refine_text(
     offset     = 2 if has_dict else 1
 
     agent = Agent(
-        model="gpt-5",
+        model="gpt-5.4",
         name="whispr_text_refiner",
         system_prompt=(
             "You are a personal voice transcription assistant. "

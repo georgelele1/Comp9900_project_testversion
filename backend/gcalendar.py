@@ -385,7 +385,7 @@ def extract_search_intent(text: str) -> dict:
     Returns {"query": "exam", "calendar": "all|name"}.
     """
     agent = Agent(
-        model="gpt-5",
+        model="gpt-5.4",
         name="whispr_search_intent",
         system_prompt=(
             "Extract a calendar search query from speech. "

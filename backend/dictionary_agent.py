@@ -293,37 +293,123 @@ def deduplicate_dictionary() -> Dict[str, Any]:
     return {"merged": removed, "total_terms": len(dictionary["terms"])}
 
 
+
+def _count_term_frequency(texts: List[str]) -> dict:
+    """Count how many transcriptions each word/phrase appears in.
+
+    Returns {lowercase_phrase: count} for all tokens seen more than once.
+    Used to give the LLM a frequency hint so it can prioritise recurring terms.
+    """
+    import re
+    freq: dict = {}
+    for text in texts:
+        # tokenise: words, hyphenated-words, acronyms, alphanumeric codes
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']*[A-Za-z0-9]|[A-Za-z0-9]", text)
+        seen_in_this = set(t.lower() for t in tokens)
+        for tok in seen_in_this:
+            freq[tok] = freq.get(tok, 0) + 1
+    # Only terms appearing in 2+ transcriptions are worth suggesting
+    return {k: v for k, v in freq.items() if v >= 2}
+
+
+
+def prune_stale_terms(all_history_texts: List[str]) -> Dict[str, Any]:
+    """Remove auto-added terms no longer found in recent history.
+    User-added terms (source == "user") are never touched.
+    """
+    dictionary = load_dictionary()
+    terms      = dictionary.get("terms", [])
+    if not terms or not all_history_texts:
+        return {"removed": [], "kept": len(terms)}
+    all_text = " ".join(all_history_texts).lower()
+    kept, removed = [], []
+    for term in terms:
+        if term.get("source", "agent") == "user":
+            kept.append(term); continue
+        phrase  = str(term.get("phrase", "")).strip().lower()
+        aliases = [str(a).strip().lower() for a in term.get("aliases", []) if str(a).strip()]
+        if (phrase in all_text) or any(a in all_text for a in aliases):
+            kept.append(term)
+        else:
+            removed.append(term.get("phrase", ""))
+    dictionary["terms"] = kept
+    save_dictionary(dictionary)
+    if removed:
+        print(f"[dictionary] pruned {len(removed)} stale: {removed[:5]}", file=sys.stderr)
+    return {"removed": removed, "kept": len(kept)}
+
 def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     texts = prepare_items_for_agent(items)
     if not texts:
         return {"added": [], "updated": [], "total_terms": len(load_dictionary().get("terms", []))}
 
-    existing_terms = load_dictionary().get("terms", [])
-    existing_hint  = ", ".join('"' + t["phrase"] + '"' for t in existing_terms[:30])
-    existing_note  = (
-        f"\nExisting terms (do NOT re-add these): {existing_hint}."
-        if existing_hint else ""
+    # ── Frequency analysis — only recurring terms are worth adding ────────────
+    freq = _count_term_frequency(texts)
+    # Build a hint: top recurring tokens sorted by frequency, skip very common words
+    _COMMON = {
+        "the","a","an","and","or","but","in","on","at","to","for","of","with",
+        "is","was","are","were","be","been","i","you","he","she","we","they",
+        "it","this","that","my","your","his","her","our","its","have","has",
+        "do","did","can","will","would","could","should","may","might","just",
+        "so","then","also","about","from","into","up","out","if","not","as",
+        "all","some","one","two","more","other","new","get","got","go","said",
+        "there","here","now","like","very","really","okay","hi","hey","yeah",
+        "when","what","how","which","who","where","because","after","before",
+        "meeting","email","message","need","want","make","let","know","think",
+        "time","day","week","today","tomorrow","back","right","good","great",
+    }
+    recurring = sorted(
+        [(k, v) for k, v in freq.items()
+         if k not in _COMMON and len(k) >= 2],
+        key=lambda x: -x[1]
+    )[:40]
+    freq_hint = (
+        "\nRecurring tokens (term: count across transcriptions): "
+        + ", ".join(f"{k}({v})" for k, v in recurring)
+        if recurring else ""
     )
 
+    # ── Existing terms — don't re-add ─────────────────────────────────────────
+    existing_terms = load_dictionary().get("terms", [])
+    existing_hint  = ", ".join('"' + t["phrase"] + '"' for t in existing_terms[:40])
+    existing_note  = (
+        f"\nAlready in dictionary (skip these): {existing_hint}."
+        if existing_hint else ""
+    )
+    
     agent = Agent(
-        model="gpt-5",
+        model="gpt-5.4",
         name="whispr_dictionary_batch_updater",
         system_prompt=(
-            "You are a dictionary term extractor for a voice transcription app. "
-            "Given transcribed texts separated by '---', identify domain-specific terms, "
-            "proper nouns, technical words, or project names that would benefit from a "
-            "correction dictionary. Skip common everyday words."
-            + existing_note +
-            " If a term is a variant of an existing one (e.g. 'frontend' vs 'front end'), "
-            "add it as an alias to the existing term instead of a new entry. "
-            "Return ONLY a JSON array: [{\"phrase\": \"...\", \"aliases\": [...]}]. "
-            "No explanation, no markdown."
+            "You are a dictionary term extractor for Whispr, a voice transcription app.\n"
+            "Find words/phrases a speech model is likely to mis-transcribe.\n\n"
+            "ADD a term only when ALL four criteria are met:\n"
+            "1. SPECIFIC — proper noun, course code, project name, brand, acronym, "
+            "technical/medical/legal term, person name, organisation.\n"
+            "   OK: COMP9900, Yanbo, PyTorch, kubectl, UNSW\n"
+            "   NOT OK: meeting, email, document, team, project\n"
+            "2. RECURRING — seen in 2+ transcriptions (use frequency hints below).\n"
+            "3. NOT COMMON — not a standard English dictionary word.\n"
+            "4. MIS-TRANSCRIPTION RISK — unusual spelling, sounds like another word, "
+            "abbreviation, number+letter mix, non-English origin.\n\n"
+            "For ALIASES list every realistic Whisper mishearing:\n"
+            "   COMP9900 → comp 9900, comp nine nine hundred, com 9900\n"
+            "   Yanbo → yan bo, yan bao, yam bo\n"
+            "   kubectl → cube ctl, kube control, cube cuttle\n\n"
+            "For TYPE pick one: course_code | person_name | project_name | "
+            "brand | acronym | technical | organisation | place | other\n\n"
+            "DO NOT add sentences, generic nouns, common verbs, filler words.\n"
+            f"{freq_hint}"
+            f"{existing_note}\n\n"
+            "Return ONLY a JSON array — no markdown, no explanation:\n"
+            "[{\"phrase\":\"COMP9900\",\"type\":\"course_code\",\"aliases\":[\"comp 9900\"]}]\n"
+            "Return [] if nothing qualifies."
         ),
     )
 
     try:
         new_terms = json.loads(str(agent.input(
-            f"Batch of {len(texts)} texts:\n\n" + "\n---\n".join(texts) +
+            f"{len(texts)} transcriptions:\n\n" + "\n---\n".join(texts) +
             "\n\nReturn JSON array only."
         )).strip())
         if not isinstance(new_terms, list):
@@ -347,10 +433,14 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             e["approved"] = True
             updated.append(e)
         else:
+            term_type = str(term.get("type", "other")).strip() or "other"
             entry = {
-                "phrase": phrase, "aliases": sorted(aliases),
-                "type": "custom", "source": "agent",
-                "confidence": 1.0, "approved": True,
+                "phrase":     phrase,
+                "aliases":    sorted(aliases),
+                "type":       term_type,
+                "source":     "agent",
+                "confidence": 1.0,
+                "approved":   True,
             }
             existing[phrase.lower()] = entry
             added.append(entry)
@@ -402,10 +492,19 @@ if __name__ == "__main__":
 
     try:
         if command == "update":
-            if not should_update_dictionary():
+            force = "--force" in sys.argv
+            # Prune stale auto-added terms on every update
+            all_texts = [
+                str(i.get("final_text", "")).strip()
+                for i in load_history().get("items", [])[-200:]
+                if str(i.get("final_text", "")).strip()
+            ]
+            prune_result = prune_stale_terms(all_texts)
+            if not force and not should_update_dictionary():
                 _exit_json({
                     "ok": True, "skipped": True, "reason": "updated recently",
                     "added": [], "updated": [],
+                    "pruned": prune_result.get("removed", []),
                     "total_terms": len(load_dictionary().get("terms", [])),
                 })
 
@@ -428,6 +527,7 @@ if __name__ == "__main__":
                 "records_processed": min(limit, len(new_items)),
                 "added":       result["added"],
                 "updated":     result["updated"],
+                "pruned":      prune_result.get("removed", []),
                 "total_terms": result["total_terms"],
             })
 
