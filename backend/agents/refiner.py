@@ -149,17 +149,28 @@ def ai_refine_text(
     if not lang or lang not in SUPPORTED_LANGUAGES:
         lang = get_target_language()
 
-    # Skip LLM for very short clean text
-    if (lang == "English"
-            and len(text.split()) < 5
-            and not re.search(r"\b(uh|um|er|so so|I I|the the)\b", text, re.IGNORECASE)):
+    # Skip LLM only for short clean English-only text.
+    # NEVER skip when:
+    #   - text contains CJK characters (Chinese/Japanese/Korean) — no spaces so
+    #     split() always returns 1 word regardless of length
+    #   - translation is needed
+    _has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+    _needs_translate = True  # always enforce target language, including English
+    if (
+        not _has_cjk
+        and not _needs_translate
+        and len(text.split()) < 5
+        and not re.search(r"\b(uh|um|er|so so|I I|the the)\b", text, re.IGNORECASE)
+    ):
         return apply_dictionary_corrections(text)
 
-    app_fmt      = _app_hint(app_name)
-    ctx_hint     = f"User context: {user_context} " if user_context else ""
-    trans        = (
-        f"Your entire output MUST be in {lang} — translate everything."
-        if lang != "English" else ""
+    app_fmt  = _app_hint(app_name)
+    ctx_hint = f"User context: {user_context} " if user_context else ""
+    trans    = (
+        f"Your entire output MUST be in {lang}. "
+        f"Translate the user's speech into {lang} whenever the source language differs. "
+        "If the source is already in the target language, keep it in that language while refining it. "
+        "Keep technical symbols, code terms, file paths, commands, APIs, version strings, and proper nouns unchanged when appropriate."
     )
 
     # Skip dictionary tool — quick_clean already applied regex corrections before routing.
@@ -190,12 +201,7 @@ def ai_refine_text(
             "If document editor → use clear paragraphs and proper structure. "
             f"{offset+4}. Fix punctuation and capitalisation. "
             f"{trans} "
-            "CRITICAL: Output ONLY the final formatted text. "
-            "Do NOT start with any preamble, introduction, or label — never write phrases like "
-            "'Here is the transcription', 'Here\\'s the transcribed text', "
-            "'This is the transcribed audio output', 'Sure, here you go', "
-            "'Transcription:', 'Output:', or any variation. "
-            "Your first word must be the first word of the actual content."
+            "Output ONLY the final formatted text. No explanation."
         ),
     )
     if has_dict:

@@ -58,11 +58,28 @@ CO_DIR   = BASE_DIR / ".co"
 
 def transcribe_audio(audio_path: str) -> str:
     import re
+
     raw = str(transcribe(audio_path)).strip()
+
+    # Strip common English wrappers
     raw = re.sub(
-        r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:]*:\s*",
-        "", raw, flags=re.IGNORECASE | re.DOTALL
+        r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:：]*[:：]\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
     ).strip()
+
+    # Strip common Chinese wrappers
+    raw = re.sub(
+        r"^(好的[，,\s]*)?(以下是(?:音檔|音频|音訊|音频文件)?的?逐字稿如下|以下是轉錄結果|以下是音檔內容|這段音訊的逐字稿如下|這段音频的逐字稿如下)[：:\s]*",
+        "",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    # Strip surrounding Chinese/English quote wrappers if the whole output is quoted
+    raw = raw.strip("「」\"' \n\t")
+
     return raw
 
 
