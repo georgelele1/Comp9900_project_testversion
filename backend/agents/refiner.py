@@ -196,7 +196,7 @@ def ai_refine_text(
             "→ format as numbered list, one item per line. Otherwise prose. "
             f"{offset+3}. Apply app-specific formatting strictly: "
             "If Mail/email app → structure as complete email with Subject:, greeting, body, sign-off. "
-            "If code editor → use technical language, preserve code terms. "
+            "If code editor → use technicag zl language, preserve code terms. "
             "If chat app → keep concise and conversational. "
             "If document editor → use clear paragraphs and proper structure. "
             f"{offset+4}. Fix punctuation and capitalisation. "
