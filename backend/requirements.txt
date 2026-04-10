@@ -1,17 +1,28 @@
 # Whispr backend dependencies
-# Install with: pip install -r requirements.txt
+# Install with: pip3 install -r requirements.txt
 
-# Connectonion agent framework
-connectonion
+# Web server
+flask>=3.0.0
+werkzeug>=3.0.0
+
+# AI / LLM
+connectonion>=0.8.0
+anthropic>=0.84.0
+openai>=2.0.0
+litellm>=1.0.0
+tiktoken>=0.12.0
 
 # Google Calendar
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-google-api-python-client
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
 
-# Timezone handling
-pytz
+# Utilities
+requests>=2.0.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
 
-# HTTP requests (used by Google auth)
-requests
+# Whisper / audio (required by connectonion)
+openai-whisper>=20230918
+torch>=2.0.0
