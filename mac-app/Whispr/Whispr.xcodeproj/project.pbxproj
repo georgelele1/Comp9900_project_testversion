@@ -146,7 +146,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\n\nBACKEND_SRC=\"${SRCROOT}/Whispr/backend\"\nBACKEND_DST=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/backend\"\n\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nrm -rf \"$BACKEND_DST\"\ncp -R \"$BACKEND_SRC\" \"$BACKEND_DST\"\n\nfind \"$BACKEND_DST\" -name \"__pycache__\" -exec rm -rf {} + 2>/dev/null || true\nfind \"$BACKEND_DST\" -name \"*.pyc\" -delete 2>/dev/null || true\nrm -rf \"$BACKEND_DST/.co\" 2>/dev/null || true\nrm -f \"$BACKEND_DST/.env\" 2>/dev/null || true\nrm -f \"$BACKEND_DST/credentials.json\" 2>/dev/null || true\nrm -f \"$BACKEND_DST/token.json\" 2>/dev/null || true\n\necho \"Backend copied successfully to $BACKEND_DST\"\n";
+			shellScript = "set -e\n\nBACKEND_SRC=\"/Users/yanbowang/Comp9900_project_testversion/backend\"\nBACKEND_DST=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/backend\"\n\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nrm -rf \"$BACKEND_DST\"\ncp -R \"$BACKEND_SRC\" \"$BACKEND_DST\"\n\nfind \"$BACKEND_DST\" -name \"__pycache__\" -exec rm -rf {} + 2>/dev/null || true\nfind \"$BACKEND_DST\" -name \"*.pyc\" -delete 2>/dev/null || true\nrm -rf \"$BACKEND_DST/.co\" 2>/dev/null || true\nrm -f \"$BACKEND_DST/.env\" 2>/dev/null || true\nrm -f \"$BACKEND_DST/credentials.json\" 2>/dev/null || true\nrm -f \"$BACKEND_DST/token.json\" 2>/dev/null || true\n\necho \"Backend copied successfully\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -290,10 +290,7 @@
 				DEVELOPMENT_TEAM = 5PV78VC56A;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
-				FRAMEWORK_SEARCH_PATHS = (
-					"$(inherited)",
-					"$(PROJECT_DIR)/Whispr/backend/_internal",
-				);
+				FRAMEWORK_SEARCH_PATHS = "$(inherited)";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Whispr/Info.plist;
 				INFOPLIST_KEY_LSUIElement = YES;
@@ -306,7 +303,6 @@
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/Whispr",
-					"$(PROJECT_DIR)/Whispr/backend/_internal",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
@@ -333,10 +329,7 @@
 				DEVELOPMENT_TEAM = 5PV78VC56A;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
-				FRAMEWORK_SEARCH_PATHS = (
-					"$(inherited)",
-					"$(PROJECT_DIR)/Whispr/backend/_internal",
-				);
+				FRAMEWORK_SEARCH_PATHS = "$(inherited)";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Whispr/Info.plist;
 				INFOPLIST_KEY_LSUIElement = YES;
@@ -349,7 +342,6 @@
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/Whispr",
-					"$(PROJECT_DIR)/Whispr/backend/_internal",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
