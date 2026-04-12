@@ -4,48 +4,79 @@ import Combine
 
 // =========================================================
 // FloatingIndicator
-// A small floating HUD pinned to the bottom-centre of the
-// screen (above the dock), shown while recording.
-// Displays an animated sound-wave (5 bars) + "Recording"
-// label. Dismissed automatically when recording stops.
-// Uses NSPanel so it never steals focus.
+//
+// A persistent HUD anchored to the bottom-centre of the screen:
+//   • Idle       — small capsule button (purple dot + "Whispr"), tap to open main window
+//   • Listening  — expanded, red waveform + "Recording…" + shortcut hint
+//   • Processing — expanded, spinner + "Transcribing…"
+//   • Expanded   — "Open" button always visible on the right
+//
+// Uses NSPanel (nonactivatingPanel) so it never steals focus.
 // =========================================================
 
-final class FloatingIndicator {
+final class FloatingIndicator: ObservableObject {
 
     private var panel: NSPanel?
-    private static let shared = FloatingIndicator()
+    private var hostingView: NSHostingView<HUDRootView>?
+    private var cancellables = Set<AnyCancellable>()
 
-    // MARK: - Public
+    // MARK: - Public API
 
-    func showIndicator() {
-        DispatchQueue.main.async {
-            guard self.panel == nil else { return }
-            self.buildPanel()
-        }
+    /// Call once at app launch to create the persistent panel and start observing status changes.
+    func createPersistentPanel() {
+        DispatchQueue.main.async { self.buildPanelIfNeeded() }
+
+        AppManager.shared.$appStatus
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                self?.update(status: status)
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Legacy shims (kept for compatibility with existing AppManager call sites)
+
+    func showIndicator(status: AppStatus = .listening) {
+        DispatchQueue.main.async { self.update(status: status) }
     }
 
     func hideIndicator() {
-        DispatchQueue.main.async {
-            guard let p = self.panel else { return }
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.18
-                p.animator().alphaValue = 0
-            }, completionHandler: {
-                p.orderOut(nil)
-                self.panel = nil
-            })
-        }
+        // No longer truly hides — resets to the idle compact state instead.
+        DispatchQueue.main.async { self.update(status: .idle) }
     }
 
-    // MARK: - Build
+    // MARK: - Internal
 
-    private func buildPanel() {
-        let W: CGFloat = 160
-        let H: CGFloat = 44
+    private func update(status: AppStatus) {
+        buildPanelIfNeeded()
+        hostingView?.rootView = HUDRootView(status: status)
+        resizePanel(for: status)
+    }
+
+    private func resizePanel(for status: AppStatus) {
+        guard let p = panel else { return }
+        let expanded = status == .listening || status == .processing
+        let newW = expanded ? HUDLayout.maxWidth : HUDLayout.idleWidth
+        guard p.frame.width != newW else { return }
+
+        // Keep the bottom-centre anchor fixed while resizing.
+        let oldFrame = p.frame
+        let newX = oldFrame.midX - newW / 2
+        let newFrame = NSRect(x: newX, y: oldFrame.minY, width: newW, height: HUDLayout.height)
+        p.setFrame(newFrame, display: true, animate: true)
+        hostingView?.frame = NSRect(x: 0, y: 0, width: newW, height: HUDLayout.height)
+    }
+
+    private func buildPanelIfNeeded() {
+        guard panel == nil else { return }
+
+        let rootView = HUDRootView(status: .idle)
+        let hosting = NSHostingView(rootView: rootView)
+        hosting.frame = NSRect(x: 0, y: 0, width: HUDLayout.idleWidth, height: HUDLayout.height)
+        hostingView = hosting
 
         let p = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+            contentRect: NSRect(x: 0, y: 0, width: HUDLayout.idleWidth, height: HUDLayout.height),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -55,93 +86,217 @@ final class FloatingIndicator {
         p.level = .floating
         p.hasShadow = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        p.ignoresMouseEvents = true
-        p.alphaValue = 0
+        p.ignoresMouseEvents = false
+        p.contentView = hosting
 
-        let hostView = NSHostingView(rootView: WaveformIndicatorView())
-        hostView.frame = NSRect(x: 0, y: 0, width: W, height: H)
-        p.contentView = hostView
-
-        // Position: bottom-centre just above the dock
-        if let screen = NSScreen.main {
-            let sf = screen.visibleFrame
-            let x  = sf.midX - W / 2
-            let y  = sf.minY + 16
-            p.setFrameOrigin(NSPoint(x: x, y: y))
-        }
-
+        repositionPanel(p, width: HUDLayout.idleWidth)
         p.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            p.animator().alphaValue = 1
+
+        // Re-centre the panel if the screen configuration changes.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self, weak p] _ in
+            guard let p else { return }
+            self?.repositionPanel(p, width: p.frame.width)
         }
 
-        self.panel = p
+        panel = p
+    }
+
+    private func repositionPanel(_ p: NSPanel, width: CGFloat) {
+        guard let screen = NSScreen.main else { return }
+        let sf = screen.visibleFrame
+        let x  = sf.midX - width / 2
+        let y  = sf.minY + 16
+        p.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }
 
 // =========================================================
-// WaveformIndicatorView — SwiftUI view inside the panel
+// Layout constants
 // =========================================================
 
-struct WaveformIndicatorView: View {
+enum HUDLayout {
+    static let height: CGFloat    = 40
+    static let maxWidth: CGFloat  = 270   // expanded (recording / processing)
+    static let idleWidth: CGFloat = 108   // compact (idle)
+}
 
-    // Each bar gets a slightly different phase so they ripple
-    @State private var phases: [Double] = [0, 0.2, 0.4, 0.2, 0]
-    @State private var animating = false
+// =========================================================
+// HUDRootView
+// =========================================================
 
-    private let barCount = 5
-    private let barWidth: CGFloat = 3
-    private let maxBarH: CGFloat  = 18
-    private let minBarH: CGFloat  = 4
-    private let barColor          = Color.white
+struct HUDRootView: View {
+
+    let status: AppStatus
+
+    private var isExpanded: Bool {
+        status == .listening || status == .processing
+    }
 
     var body: some View {
         ZStack {
-            // Pill background
             Capsule()
-                .fill(Color(white: 0.08, opacity: 0.92))
+                .fill(Color(white: 0.08, opacity: 0.90))
                 .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 0.5))
 
-            HStack(spacing: 10) {
-                // Animated waveform bars
-                HStack(alignment: .center, spacing: 3) {
-                    ForEach(0..<barCount, id: \.self) { i in
-                        RoundedRectangle(cornerRadius: 1.5)
-                            .fill(Color.red.opacity(0.9))
-                            .frame(width: barWidth, height: barHeight(for: i))
-                            .animation(
-                                .easeInOut(duration: 0.45 + Double(i) * 0.06)
-                                .repeatForever(autoreverses: true)
-                                .delay(Double(i) * 0.08),
-                                value: phases[i]
-                            )
-                    }
+            HStack(spacing: 0) {
+
+                // Left status area
+                HStack(spacing: 7) {
+                    leftContent
                 }
-                .frame(width: CGFloat(barCount) * (barWidth + 3) - 3, height: maxBarH)
+                .padding(.leading, 13)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Text("Recording")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white)
-            }
-            .padding(.horizontal, 14)
-        }
-        .frame(width: 160, height: 44)
-        .onAppear { startAnimation() }
-    }
+                if isExpanded {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.13))
+                        .frame(width: 1, height: 22)
 
-    private func barHeight(for index: Int) -> CGFloat {
-        let t = phases[index]
-        // t oscillates 0→1 driven by animation; map to minBarH…maxBarH
-        return minBarH + CGFloat(t) * (maxBarH - minBarH)
-    }
-
-    private func startAnimation() {
-        // Stagger the target phase for each bar so they ripple
-        for i in 0..<barCount {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.05) {
-                phases[i] = 1.0
+                    openButton
+                }
             }
         }
+        .frame(
+            width: isExpanded ? HUDLayout.maxWidth : HUDLayout.idleWidth,
+            height: HUDLayout.height
+        )
+        // In idle/error state the whole capsule is tappable.
+        .contentShape(Capsule())
+        .onTapGesture {
+            if status == .idle || status == .error {
+                openMainWindow()
+            }
+        }
+    }
+
+    // MARK: - Left content
+
+    @ViewBuilder
+    private var leftContent: some View {
+        switch status {
+        case .idle:
+            Circle()
+                .fill(Color(red: 0.498, green: 0.467, blue: 0.867))
+                .frame(width: 7, height: 7)
+            Text("Whispr")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(Color.white.opacity(0.82))
+
+        case .listening:
+            HUDWaveform()
+            Text("Recording…")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(Color(red: 0.94, green: 0.59, blue: 0.48))
+            Text("⌥S to stop")
+                .font(.system(size: 10))
+                .foregroundColor(Color.white.opacity(0.32))
+
+        case .processing:
+            HUDSpinner()
+            Text("Transcribing…")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(Color(red: 0.686, green: 0.663, blue: 0.925))
+
+        case .error:
+            Circle()
+                .fill(Color(red: 0.886, green: 0.294, blue: 0.290))
+                .frame(width: 7, height: 7)
+            Text("Error")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(Color(red: 0.94, green: 0.76, blue: 0.76))
+        }
+    }
+
+    // MARK: - Open button
+
+    private var openButton: some View {
+        Button(action: openMainWindow) {
+            HStack(spacing: 4) {
+                Image(systemName: "macwindow")
+                    .font(.system(size: 10, weight: .medium))
+                Text("Open")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .foregroundColor(Color.white.opacity(0.62))
+            .padding(.horizontal, 12)
+            .frame(height: HUDLayout.height)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Action
+
+    private func openMainWindow() {
+        MainWindowController.shared.navigate(to: .home)
+        DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
+    }
+}
+
+// =========================================================
+// HUDWaveform — 5-bar animated waveform shown while recording
+// =========================================================
+
+struct HUDWaveform: View {
+
+    @State private var phases: [Double] = [0.3, 0.7, 0.4, 0.9, 0.5]
+
+    private let count = 5
+    private let barW: CGFloat = 3
+    private let maxH: CGFloat = 16
+    private let minH: CGFloat = 3
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 2) {
+            ForEach(0..<count, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color(red: 0.886, green: 0.294, blue: 0.290).opacity(0.9))
+                    .frame(width: barW, height: minH + CGFloat(phases[i]) * (maxH - minH))
+                    .animation(
+                        .easeInOut(duration: 0.42 + Double(i) * 0.07)
+                        .repeatForever(autoreverses: true)
+                        .delay(Double(i) * 0.09),
+                        value: phases[i]
+                    )
+            }
+        }
+        .frame(height: maxH)
+        .onAppear {
+            let targets: [Double] = [0.9, 0.4, 1.0, 0.6, 0.8]
+            for i in 0..<count {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.05) {
+                    phases[i] = targets[i]
+                }
+            }
+        }
+    }
+}
+
+// =========================================================
+// HUDSpinner — circular progress indicator shown while processing
+// =========================================================
+
+struct HUDSpinner: View {
+
+    @State private var rotating = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.75)
+            .stroke(
+                Color(red: 0.686, green: 0.663, blue: 0.925),
+                style: StrokeStyle(lineWidth: 1.8, lineCap: .round)
+            )
+            .frame(width: 13, height: 13)
+            .rotationEffect(.degrees(rotating ? 360 : 0))
+            .animation(
+                .linear(duration: 0.85).repeatForever(autoreverses: false),
+                value: rotating
+            )
+            .onAppear { rotating = true }
     }
 }
