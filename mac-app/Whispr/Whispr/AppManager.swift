@@ -19,29 +19,23 @@ final class AppManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     func initialize() {
+        // Create the persistent HUD — it observes $appStatus internally.
+        floatingIndicator.createPersistentPanel()
+
         hotkeyManager.setupGlobalHotkey { [weak self] shouldStart in
             guard let self else { return }
-
             if shouldStart {
                 self.startRecordingFromMenu()
             } else {
                 self.stopRecordingAndProcess()
             }
         }
-
-        audioRecorder.$isRecording
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording in
-                guard let self else { return }
-
-                if isRecording {
-                    self.updateAppStatus(.listening)
-                    self.floatingIndicator.showIndicator()
-                } else {
-                    self.floatingIndicator.hideIndicator()
-                }
-            }
-            .store(in: &cancellables)
+        // Intentionally no $isRecording sink here.
+        // A sink on isRecording races with the manual stop path:
+        // stopRecording() sets isRecording=false synchronously, but
+        // updateAppStatus(.processing) is async, so the sink would
+        // still see appStatus==.listening and fire a second stop.
+        // Timeout auto-stop is handled by AudioRecorder.audioRecorderDidFinishRecording instead.
     }
 
     func updateDictionary() {
@@ -117,6 +111,7 @@ final class AppManager: ObservableObject {
 
         do {
             try audioRecorder.startRecording()
+            updateAppStatus(.listening)   // HUD expands to "Recording…"
         } catch {
             updateAppStatus(.error)
             showErrorAlert(message: "Failed to start recording: \(error.localizedDescription)")
@@ -130,7 +125,7 @@ final class AppManager: ObservableObject {
             return
         }
 
-        updateAppStatus(.processing)
+        updateAppStatus(.processing)   // HUD switches to "Transcribing…"
 
         if FileManager.default.fileExists(atPath: audioFileURL.path) {
             print("audio path =", audioFileURL.path)
@@ -150,8 +145,7 @@ final class AppManager: ObservableObject {
                 switch result {
                 case .success(let text):
                     self.lastOutputText = text
-                    self.updateAppStatus(.idle)
-                    // Text is pasted directly — no floating window needed
+                    self.updateAppStatus(.idle)   // HUD collapses back to small button
                     self.pasteTextToActiveApp(text: text)
 
                 case .failure(let error):
@@ -204,6 +198,7 @@ final class AppManager: ObservableObject {
         keyUp?.flags = .maskCommand
         keyUp?.post(tap: .cghidEventTap)
 
+        // Restore the previous pasteboard contents after a short delay.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             pasteboard.clearContents()
             previousItems?.forEach { item in
