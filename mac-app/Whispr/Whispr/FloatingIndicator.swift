@@ -81,10 +81,10 @@ final class FloatingIndicator: ObservableObject {
             backing: .buffered,
             defer: false
         )
-        p.isOpaque = false
-        p.backgroundColor = .clear
-        p.level = .floating
-        p.hasShadow = true
+        p.isOpaque           = false
+        p.backgroundColor    = .clear
+        p.level              = .statusBar
+        p.hasShadow          = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.ignoresMouseEvents = false
         p.contentView = hosting

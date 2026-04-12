@@ -16,18 +16,17 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     func startRecording() throws {
         guard !isRecording else { return }
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = "whispr_recording_\(UUID().uuidString).wav"
-        let url = tempDir.appendingPathComponent(fileName)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("whispr_recording_\(UUID().uuidString).wav")
         tempAudioURL = url
 
         let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: 16000.0,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsFloatKey: false
+            AVFormatIDKey:              kAudioFormatLinearPCM,
+            AVSampleRateKey:            16000.0,
+            AVNumberOfChannelsKey:      1,
+            AVLinearPCMBitDepthKey:     16,
+            AVLinearPCMIsBigEndianKey:  false,
+            AVLinearPCMIsFloatKey:      false
         ]
 
         recorder = try AVAudioRecorder(url: url, settings: settings)
@@ -44,7 +43,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
         manualStop = false
         isRecording = true
-        NSLog("Started recording: \(url.path)")
     }
 
     func stopRecording() -> URL? {
@@ -53,8 +51,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         manualStop = true   // Mark as manual so the delegate doesn't trigger a second stop.
         recorder?.stop()
         isRecording = false
-        NSLog("Stopped recording")
-
         return tempAudioURL
     }
 
