@@ -9,6 +9,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private var tempAudioURL: URL?
     private let maxRecordingDuration: TimeInterval = 300
 
+    // Tracks whether the current stop was triggered manually (via stopRecording()).
+    // If false when audioRecorderDidFinishRecording fires, it was a timeout auto-stop.
+    private var manualStop = false
+
     func startRecording() throws {
         guard !isRecording else { return }
 
@@ -38,6 +42,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             )
         }
 
+        manualStop = false
         isRecording = true
         NSLog("Started recording: \(url.path)")
     }
@@ -45,6 +50,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     func stopRecording() -> URL? {
         guard isRecording else { return nil }
 
+        manualStop = true   // Mark as manual so the delegate doesn't trigger a second stop.
         recorder?.stop()
         isRecording = false
         NSLog("Stopped recording")
@@ -52,13 +58,27 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         return tempAudioURL
     }
 
+    // MARK: - AVAudioRecorderDelegate
+
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        if !flag {
+        guard !manualStop else {
+            // Manual stop already handled by stopRecording() — nothing to do.
+            manualStop = false
+            return
+        }
+
+        // Reached here only on a timeout auto-stop (maxRecordingDuration elapsed).
+        isRecording = false
+        if flag {
+            // Kick off the transcription pipeline just as a manual stop would.
+            DispatchQueue.main.async {
+                AppManager.shared.stopRecordingAndProcess()
+            }
+        } else {
             AppManager.shared.showErrorAlert(message: "Recording failed to finish successfully")
             tempAudioURL = nil
+            AppManager.shared.updateAppStatus(.error)
         }
-        isRecording = false
-        AppManager.shared.floatingIndicator.hideIndicator()
     }
 
     func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
