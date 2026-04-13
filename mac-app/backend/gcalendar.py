@@ -15,6 +15,9 @@ CLI:
 """
 from __future__ import annotations
 
+# Pre-import stdlib calendar before agents/ path is active
+import calendar as _stdlib_calendar  # noqa: F401
+
 import getpass
 import io as _io
 import json
@@ -49,7 +52,7 @@ SCOPES           = [
     "openid",
 ]
 REDIRECT_URI     = "http://localhost:8765/callback"
-CREDENTIALS_FILE = Path(__file__).resolve().parent / "./credentials.json"
+CREDENTIALS_FILE = Path(__file__).resolve().parent / "credentials.json"
 DEFAULT_TZ       = "Australia/Sydney"
 
 
