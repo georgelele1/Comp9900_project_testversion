@@ -64,7 +64,7 @@ from agents.intent   import detect_intent
 from agents.plugins.session import session_remember
 from agents.refiner  import run as run_refiner
 from agents.knowledge import run as run_knowledge
-from agents.cal       import run as run_calendar
+from agents.cal_agent       import run as run_calendar
 
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR   = BASE_DIR / ".co"
