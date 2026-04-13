@@ -11,7 +11,8 @@ final class AppManager: ObservableObject {
     let localBackendClient = LocalBackendClient()
     let activeAppDetector  = ActiveAppDetector()
 
-    private var pill: FloatingStatusButton { .shared }
+    // FloatingIndicator is the correct type — FloatingStatusButton does not exist
+    private let floatingIndicator = FloatingIndicator()
 
     @Published var appStatus: AppStatus = .idle
     @Published var lastOutputText: String = ""
@@ -23,7 +24,6 @@ final class AppManager: ObservableObject {
     // MARK: - Init
 
     func initialize() {
-        // Create the persistent HUD — it observes $appStatus internally.
         floatingIndicator.createPersistentPanel()
 
         hotkeyManager.setupGlobalHotkey { [weak self] shouldStart in
@@ -34,12 +34,6 @@ final class AppManager: ObservableObject {
                 self.stopRecordingAndProcess()
             }
         }
-        // Intentionally no $isRecording sink here.
-        // A sink on isRecording races with the manual stop path:
-        // stopRecording() sets isRecording=false synchronously, but
-        // updateAppStatus(.processing) is async, so the sink would
-        // still see appStatus==.listening and fire a second stop.
-        // Timeout auto-stop is handled by AudioRecorder.audioRecorderDidFinishRecording instead.
     }
 
     // MARK: - Dictionary
@@ -56,7 +50,6 @@ final class AppManager: ObservableObject {
                 switch result {
                 case .success(let update):
                     self.updateAppStatus(.idle)
-                    self.pill.update(.idle)
                     let alert = NSAlert()
                     alert.messageText = "Dictionary Updated"
                     var lines = ["Total terms: \(update.totalTerms)"]
@@ -77,7 +70,6 @@ final class AppManager: ObservableObject {
                     alert.runModal()
                 case .failure(let error):
                     self.updateAppStatus(.error)
-                    self.pill.update(.error)
                     self.showErrorAlert(message: "Dictionary update failed: \(error.localizedDescription)")
                 }
             }
@@ -115,14 +107,13 @@ final class AppManager: ObservableObject {
     func startRecording() {
         guard localBackendClient.isBackendAvailable else {
             updateAppStatus(.error)
-            pill.update(.error)
             showErrorAlert(message: "Python backend is not accessible")
             return
         }
 
         do {
             try audioRecorder.startRecording()
-            updateAppStatus(.listening)   // HUD expands to "Recording…"
+            updateAppStatus(.listening)
         } catch {
             updateAppStatus(.error)
             showErrorAlert(message: "Failed to start recording: \(error.localizedDescription)")
@@ -132,20 +123,14 @@ final class AppManager: ObservableObject {
     func stopRecordingAndProcess() {
         guard let audioFileURL = audioRecorder.stopRecording() else {
             updateAppStatus(.error)
-            pill.update(.error)
             showErrorAlert(message: "No audio file recorded")
             return
         }
 
-        updateAppStatus(.processing)   // HUD switches to "Transcribing…"
+        updateAppStatus(.processing)
 
-        if FileManager.default.fileExists(atPath: audioFileURL.path) {
-            print("audio path =", audioFileURL.path)
-            print("file exists before run = true")
-        } else {
-            print("audio path =", audioFileURL.path)
-            print("file exists before run = false")
-        }
+        print("audio path =", audioFileURL.path)
+        print("file exists before run =", FileManager.default.fileExists(atPath: audioFileURL.path))
 
         localBackendClient.transcribeAudio(
             fileURL: audioFileURL,
@@ -156,12 +141,11 @@ final class AppManager: ObservableObject {
                 switch result {
                 case .success(let text):
                     self.lastOutputText = text
-                    self.updateAppStatus(.idle)   // HUD collapses back to small button
-                    self.pasteTextToActiveApp(text: text)
+                    self.updateAppStatus(.idle)
+                    self.pasteTextToTargetApp(text: text)
 
                 case .failure(let error):
                     self.updateAppStatus(.error)
-                    self.pill.update(.error)
                     self.showErrorAlert(message: "Transcription failed: \(error.localizedDescription)")
                 }
             }
@@ -194,13 +178,21 @@ final class AppManager: ObservableObject {
 
     private func pasteTextToTargetApp(text: String) {
         let pasteboard = NSPasteboard.general
-        let previous   = pasteboard.pasteboardItems
+        // Capture previous contents before clearing
+        let previousItems = pasteboard.pasteboardItems?.map { item -> [NSPasteboard.PasteboardType: Data] in
+            var data: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let d = item.data(forType: type) {
+                    data[type] = d
+                }
+            }
+            return data
+        }
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
-        let source = CGEventSource(stateID: .hidSystemState)
-
+        let source  = CGEventSource(stateID: .hidSystemState)
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
         keyDown?.flags = .maskCommand
         keyDown?.post(tap: .cghidEventTap)
@@ -209,14 +201,12 @@ final class AppManager: ObservableObject {
         keyUp?.flags = .maskCommand
         keyUp?.post(tap: .cghidEventTap)
 
-        // Restore the previous pasteboard contents after a short delay.
+        // Restore previous pasteboard contents after paste completes
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             pasteboard.clearContents()
-            previousItems?.forEach { item in
-                for type in item.types {
-                    if let data = item.data(forType: type) {
-                        pasteboard.setData(data, forType: type)
-                    }
+            previousItems?.forEach { dict in
+                for (type, data) in dict {
+                    pasteboard.setData(data, forType: type)
                 }
             }
         }
