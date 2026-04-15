@@ -513,7 +513,7 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def create_agent() -> Agent:
     agent = Agent(
-        model="gpt-5",
+        model="gpt-5.4",
         name="whispr_dictionary_agent",
         system_prompt=(
             "You are Whispr's personal dictionary agent. "
