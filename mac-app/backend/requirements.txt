@@ -13,8 +13,5 @@ typer>=0.20.0
 uvicorn>=0.20.0
 websockets>=11.0.0
 pytz>=2024.1
-# Google Calendar (used by gcalendar.py)
-google-api-python-client>=2.0.0
-google-auth>=2.0.0
-google-auth-oauthlib>=1.0.0
-google-auth-httplib2>=0.1.0
+# mac Calendar (used by gcalendar.py)
+pyobjc-framework-EventKit
