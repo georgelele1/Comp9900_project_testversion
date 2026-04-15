@@ -28,10 +28,11 @@ def _classify(text: str, session_context: str = "") -> str:
         name="whispr_intent_classifier",
         system_prompt=(
             "Classify this voice transcription into exactly one label:\n\n"
-            "  calendar  — anything about the user's own schedule, events, appointments,\n"
+            "  calendar  — the user is ASKING A QUESTION or making a QUERY directed at\n"
+            "              their calendar system. They want to retrieve schedule information.\n"
             "              exams, deadlines, meetings, or asking when something is.\n"
             "              Examples: 'what is my exam date', 'when is my dentist',\n"
-            "              'do I have anything today', 'search my calendar for COMP9417'\n\n"
+            "              'do I have anything today', 'search my calendar for '\n\n"
             "  knowledge — asking a factual question, wanting an explanation, definition,\n"
             "              formula, concept, or how something works.\n"
             "              Examples: 'what is Newton's law', 'explain TCP vs UDP',\n"
