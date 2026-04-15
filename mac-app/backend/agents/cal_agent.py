@@ -1,12 +1,12 @@
 """
 agents/cal_agent.py — Calendar fetch and search subagent.
 
+Reads from Mac Calendar (EventKit) via gcalendar.py.
+No Google OAuth, no email, no tokens.
+
 Events:
   after_user_input → inject_date     (temporal grounding)
   before_llm       → inject_language (language rule)
-
-No profile, dictionary, eval, or snippet updates.
-Calendar returns raw schedule data — not user-facing refined text.
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def _extract_intent(text: str) -> dict:
             "For fetch reply ONLY with JSON:\n"
             '  {"mode":"fetch","date":"today|tomorrow|this week|next week|YYYY-MM-DD","calendar":"name|all"}\n\n'
             "For search reply ONLY with JSON:\n"
-            '  {"mode":"search","query":"<best search term for Google Calendar>","calendar":"name|all"}\n\n'
+            '  {"mode":"search","query":"<best search term for Mac Calendar>","calendar":"name|all"}\n\n'
             "query must be the most specific term that would match the event title "
             "— include course codes, keywords, or proper nouns from the input.\n"
             "calendar=all unless the user names a specific calendar.\n"
@@ -77,17 +77,12 @@ def _extract_intent(text: str) -> dict:
     try:
         return json.loads(raw)
     except Exception:
-        # Fallback: treat as a search with the full input as the query
         return {"mode": "search", "query": text.strip(), "calendar": "all"}
 
 
 def run(text: str, raw_text: str) -> str:
     """Fetch schedule or search calendar based on speech."""
-    from gcalendar import load_current_email, get_schedule, search_events
-
-    email = load_current_email()
-    if not email:
-        return "No Google Calendar connected."
+    from gcalendar import get_schedule, search_events
 
     intent = _extract_intent(raw_text)
     mode   = intent.get("mode", "search")
@@ -97,10 +92,10 @@ def run(text: str, raw_text: str) -> str:
 
     if mode == "fetch":
         date   = intent.get("date") or "today"
-        result = get_schedule(date=date, user_id=email, calendar_filter=cal)
+        result = get_schedule(date=date, calendar_filter=cal)
     else:
         query  = intent.get("query") or raw_text.strip()
-        result = search_events(query=query, user_id=email, calendar_filter=cal)
+        result = search_events(query=query, calendar_filter=cal)
 
     if not result or not result.strip() or "no events found" in result.lower():
         return "Your calendar is clear — no events found."
