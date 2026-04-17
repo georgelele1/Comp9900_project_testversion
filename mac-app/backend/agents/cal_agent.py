@@ -2,7 +2,6 @@
 agents/cal_agent.py — Calendar fetch and search subagent.
 
 Reads from Mac Calendar (EventKit) via gcalendar.py.
-No Google OAuth, no email, no tokens.
 
 Events:
   after_user_input → inject_date     (temporal grounding)
@@ -11,16 +10,10 @@ Events:
 from __future__ import annotations
 
 import json
-import sys
-import io as _io
 from datetime import datetime
 
 import pytz
-
-_real = sys.stdout
-sys.stdout = _io.StringIO()
 from connectonion import Agent, after_user_input, before_llm
-sys.stdout = _real
 
 from agents.plugins.lang       import inject_language
 from agents.plugins.visibility import show_summary
@@ -43,12 +36,7 @@ def _inject_date(agent) -> None:
 
 
 def _extract_intent(text: str) -> dict:
-    """Single LLM call — decides mode, date/query, and calendar filter.
-
-    Returns one of:
-      {"mode": "fetch",  "date": "today|tomorrow|this week|next week|YYYY-MM-DD", "calendar": "name|all"}
-      {"mode": "search", "query": "<search term>",                                 "calendar": "name|all"}
-    """
+    """Single LLM call — decides mode, date/query, and calendar filter."""
     agent = Agent(
         model="gpt-5.4",
         name="whispr_calendar_intent",
@@ -87,8 +75,6 @@ def run(text: str, raw_text: str) -> str:
     intent = _extract_intent(raw_text)
     mode   = intent.get("mode", "search")
     cal    = intent.get("calendar") or "all"
-
-    print(f"[cal_agent] intent={intent}", file=sys.stderr)
 
     if mode == "fetch":
         date   = intent.get("date") or "today"

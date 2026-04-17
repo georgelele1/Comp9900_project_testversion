@@ -1,23 +1,14 @@
 """
 agents/intent.py — LLM-based intent detection.
 
-Single LLM call classifies intent into: calendar | knowledge | refine
-
-No regex Layer 1 — the LLM handles all cases including edge cases like
-"what is my exam date" (calendar) vs "what is Newton's law" (knowledge).
+Classifies intent into: calendar | knowledge | refine
 
 Followup detection uses shared session context so consecutive questions
 route correctly based on previous exchange type.
 """
 from __future__ import annotations
 
-import sys
-import io as _io
-
-_real = sys.stdout
-sys.stdout = _io.StringIO()
 from connectonion import Agent
-sys.stdout = _real
 
 
 def _classify(text: str, session_context: str = "") -> str:
@@ -56,22 +47,16 @@ def detect_intent(text: str) -> str:
     """Returns: 'calendar' | 'knowledge' | 'refine'"""
     from agents.plugins.session import get_session_context, is_followup, _SESSION
 
-    # Fast-path for obvious followups — check session to decide which agent
     if is_followup(text) and _SESSION:
         for msg in reversed(_SESSION):
             if msg["role"] == "assistant":
                 content = msg["content"]
-                # If previous answer looks like knowledge, continue with knowledge
                 if len(content) > 100 or any(
                     kw in content.lower() for kw in
                     ["formula", "equation", "defined as", "refers to", "is a type",
                      "algorithm", "protocol", "theorem", "law of", "concept"]
                 ):
-                    print("[intent] followup → knowledge", file=sys.stderr)
                     return "knowledge"
-                print("[intent] followup → refine", file=sys.stderr)
                 return "refine"
 
-    intent = _classify(text, get_session_context())
-    print(f"[intent] LLM → {intent}", file=sys.stderr)
-    return intent
+    return _classify(text, get_session_context())
