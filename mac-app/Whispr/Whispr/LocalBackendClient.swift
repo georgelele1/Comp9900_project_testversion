@@ -2,6 +2,9 @@ import Foundation
 import Combine
 import EventKit
 import AppKit
+
+// MARK: - Shared response types (kept for DictionaryView / AppManager)
+
 struct DictionaryTerm {
     let phrase: String
     let type: String
@@ -10,26 +13,31 @@ struct DictionaryTerm {
 
     init?(dict: [String: Any]) {
         guard let phrase = dict["phrase"] as? String else { return nil }
-        self.phrase = phrase
-        self.type = dict["type"] as? String ?? "custom"
-        self.aliases = dict["aliases"] as? [String] ?? []
+        self.phrase     = phrase
+        self.type       = dict["type"]       as? String ?? "custom"
+        self.aliases    = dict["aliases"]    as? [String] ?? []
         self.confidence = dict["confidence"] as? Double ?? 1.0
     }
 }
 
 struct DictionaryUpdateResult {
-    let added: [DictionaryTerm]
-    let updated: [DictionaryTerm]
+    let added     : [DictionaryTerm]
+    let updated   : [DictionaryTerm]
     let totalTerms: Int
 }
 
+// MARK: - LocalBackendClient
+
 final class LocalBackendClient: ObservableObject {
-    @Published var isBackendAvailable = false
+
+    @Published var isBackendAvailable: Bool = false
     @Published var calendarPermission: EKAuthorizationStatus = .notDetermined
 
-    private let timeout: TimeInterval = 300
+    /// Currently active model ID — kept in sync with backend storage.
+    @Published var activeModel: String = Config.defaultModel
 
-    private var pythonPath: String?
+    private let timeout: TimeInterval = 300
+    private var pythonPath       : String?
     private var backendScriptPath: String?
 
     init() {
@@ -37,6 +45,11 @@ final class LocalBackendClient: ObservableObject {
         refreshCalendarPermission()
 
         if isBackendAvailable {
+            // Sync active model from backend on launch
+            fetchModelFromBackend { [weak self] model in
+                if let model { self?.activeModel = model }
+            }
+            // Background dictionary refresh
             DispatchQueue.global(qos: .background).async {
                 self.runDictionaryUpdate { _ in }
             }
@@ -51,26 +64,17 @@ final class LocalBackendClient: ObservableObject {
         let fm = FileManager.default
 
         pythonPath = Bundle.main.resourceURL?
-            .appendingPathComponent("runtime", isDirectory: true)
-            .appendingPathComponent("venv", isDirectory: true)
-            .appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent("python")
+            .appendingPathComponent("runtime/venv/bin/python")
             .path
 
         backendScriptPath = Bundle.main.resourceURL?
-            .appendingPathComponent("backend", isDirectory: true)
-            .appendingPathComponent("app.py")
+            .appendingPathComponent("backend/app.py")
             .path
 
-        if let pythonPath, !fm.fileExists(atPath: pythonPath) {
-            self.pythonPath = nil
-        }
+        if let p = pythonPath,        !fm.fileExists(atPath: p) { pythonPath        = nil }
+        if let p = backendScriptPath, !fm.fileExists(atPath: p) { backendScriptPath = nil }
 
-        if let backendScriptPath, !fm.fileExists(atPath: backendScriptPath) {
-            self.backendScriptPath = nil
-        }
-
-        isBackendAvailable = (self.pythonPath != nil && self.backendScriptPath != nil)
+        isBackendAvailable = (pythonPath != nil && backendScriptPath != nil)
     }
 
     func refreshRuntimePaths() {
@@ -87,18 +91,14 @@ final class LocalBackendClient: ObservableObject {
         }
     }
 
-    /// Request calendar access. Calls back on main thread with the granted status.
     func requestCalendarPermission(completion: @escaping (Bool) -> Void) {
         let store = EKEventStore()
-
         let handler: (Bool, Error?) -> Void = { granted, _ in
             DispatchQueue.main.async {
                 self.calendarPermission = EKEventStore.authorizationStatus(for: .event)
                 completion(granted)
             }
         }
-
-        // Use the newer API on macOS 14+, fall back for earlier versions
         if #available(macOS 14.0, *) {
             store.requestFullAccessToEvents(completion: handler)
         } else {
@@ -106,7 +106,6 @@ final class LocalBackendClient: ObservableObject {
         }
     }
 
-    /// Open System Settings → Privacy → Calendars so the user can grant access.
     func openCalendarSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
             NSWorkspace.shared.open(url)
@@ -114,129 +113,143 @@ final class LocalBackendClient: ObservableObject {
     }
 
     // =========================================================
-    // Run a generic Python CLI command and return raw output
+    // Debug
+    // =========================================================
+
+    /// Flip to true to print every command, stdout, and stderr to the Xcode console.
+    static var debugMode = true
+
+    private func debugLog(_ label: String, script: String, args: [String], out: String, err: String, status: Int32) {
+        guard Self.debugMode else { return }
+        // args may already contain script as first element (transcribeAudio passes process.arguments)
+        // so only prepend script if it's not already there
+        let allArgs = args.first == script ? args : [script] + args
+        let cmd = allArgs.joined(separator: " ")
+        print("""
+        ┌─[Whispr Debug]──────────────────────────────
+        │ CMD : \(cmd)
+        │ EXIT: \(status)
+        │ STDOUT:
+        \(out.isEmpty ? "  (empty)" : out.split(separator: "\n").map { "  " + $0 }.joined(separator: "\n"))
+        │ STDERR:
+        \(err.isEmpty ? "  (empty)" : err.split(separator: "\n").map { "  " + $0 }.joined(separator: "\n"))
+        └─────────────────────────────────────────────
+        """)
+    }
+
+    // =========================================================
+    // Core Python runner
     // =========================================================
 
     private func runPythonCommand(
-        script: String,
-        arguments: [String],
+        script    : String,
+        arguments : [String],
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         guard let pythonPath else {
-            completion(.failure(NSError(
-                domain: "LocalBackendClient",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Python not found"]
-            )))
+            completion(.failure(makeError("Python not found")))
             return
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.currentDirectoryURL = URL(fileURLWithPath: script).deletingLastPathComponent()
-            process.executableURL = URL(fileURLWithPath: pythonPath)
-            process.arguments = [script] + arguments
-            process.environment = ProcessInfo.processInfo.environment
+            process.executableURL       = URL(fileURLWithPath: pythonPath)
+            process.arguments           = [script] + arguments
+            process.environment         = ProcessInfo.processInfo.environment
 
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError  = errPipe
 
-            do {
-                try process.run()
-            } catch {
-                DispatchQueue.main.async {
-                    completion(.failure(error))
-                }
-                return
-            }
+            do    { try process.run() }
+            catch { DispatchQueue.main.async { completion(.failure(error)) }; return }
 
             process.waitUntilExit()
 
-            let output = String(
-                data: outputPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8
-            ) ?? ""
+            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 
-            let stderr = String(
-                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8
-            ) ?? ""
+            self.debugLog("runPythonCommand", script: script, args: arguments,
+                          out: out, err: err, status: process.terminationStatus)
+
+            // Strip connectonion noise lines ([env], [co], [agent]) that pollute stdout
+            let cleanOut = out.components(separatedBy: .newlines)
+                .filter { line in
+                    let t = line.trimmingCharacters(in: .whitespaces)
+                    return !t.hasPrefix("[env]") && !t.hasPrefix("[co]") &&
+                           !t.hasPrefix("[agent]") && !t.hasPrefix("[whispr]")
+                }
+                .joined(separator: "\n")
 
             DispatchQueue.main.async {
                 if process.terminationStatus == 0 {
-                    completion(.success(output))
+                    completion(.success(cleanOut))
                 } else {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient",
-                        code: Int(process.terminationStatus),
-                        userInfo: [NSLocalizedDescriptionKey: stderr.isEmpty ? "Command failed" : stderr]
-                    )))
+                    completion(.failure(self.makeError(err.isEmpty ? "Command failed" : err)))
                 }
             }
         }
     }
 
+    private func makeError(_ msg: String) -> Error {
+        NSError(domain: "LocalBackendClient", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: msg])
+    }
+
     // =========================================================
-    // Dictionary update
+    // Model management
     // =========================================================
 
-    func runDictionaryUpdate(completion: @escaping (Result<DictionaryUpdateResult, Error>) -> Void) {
-        guard let backendScriptPath else {
-            completion(.failure(NSError(
-                domain: "LocalBackendClient",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Backend script not found"]
-            )))
-            return
+    func fetchModelFromBackend(completion: @escaping (String?) -> Void) {
+        guard let backendScriptPath else { completion(nil); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "get-model"]) { result in
+            guard case .success(let output) = result,
+                  let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let model = json["model"] as? String
+            else { completion(nil); return }
+            completion(model)
         }
+    }
 
-        let dictionaryScriptPath = URL(fileURLWithPath: backendScriptPath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("agents", isDirectory: true)
-            .appendingPathComponent("dictionary_agent.py")
-            .path
-
-        guard FileManager.default.fileExists(atPath: dictionaryScriptPath) else {
-            completion(.failure(NSError(
-                domain: "LocalBackendClient",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "dictionary_agent.py not found"]
-            )))
-            return
+    func setModelOnBackend(_ modelID: String, completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "set-model", modelID]) { [weak self] result in
+            let ok = (try? result.get()) != nil
+            if ok { self?.activeModel = modelID }
+            completion(ok)
         }
+    }
 
-        runPythonCommand(script: dictionaryScriptPath, arguments: ["cli", "update"]) { result in
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
+    // =========================================================
+    // API key management (OpenAI — stored as .env on backend)
+    // =========================================================
 
-            case .success(let output):
-                let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Returns whether a key is currently stored (does NOT return the key itself).
+    func checkAPIKeyExists(provider: String = "openai", completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "get-api-key", provider]) { result in
+            guard case .success(let output) = result,
+                  let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { completion(false); return }
+            completion(json["has_key"] as? Bool ?? false)
+        }
+    }
 
-                guard
-                    let jsonLine = trimmed
-                        .components(separatedBy: .newlines)
-                        .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-                        .last(where: { $0.hasPrefix("{") && $0.hasSuffix("}") }),
-                    let data = jsonLine.data(using: .utf8),
-                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else {
-                    completion(.success(DictionaryUpdateResult(added: [], updated: [], totalTerms: 0)))
-                    return
-                }
+    func saveAPIKey(_ key: String, provider: String = "openai", completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "set-api-key", key, provider]) { result in
+            completion((try? result.get()) != nil)
+        }
+    }
 
-                let added = (json["added"] as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
-                let updated = (json["updated"] as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
-                let total = json["total_terms"] as? Int ?? 0
-
-                completion(.success(DictionaryUpdateResult(
-                    added: added,
-                    updated: updated,
-                    totalTerms: total
-                )))
-            }
+    func removeAPIKey(provider: String = "openai", completion: @escaping (Bool) -> Void) {
+        guard let backendScriptPath else { completion(false); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "remove-api-key", provider]) { result in
+            completion((try? result.get()) != nil)
         }
     }
 
@@ -245,16 +258,12 @@ final class LocalBackendClient: ObservableObject {
     // =========================================================
 
     func transcribeAudio(
-        fileURL: URL,
-        appName: String,
-        completion: @escaping (Result<String, Error>) -> Void
+        fileURL : URL,
+        appName : String,
+        completion: @escaping (Result<(text: String, cost: Double?), Error>) -> Void
     ) {
         guard let pythonPath, let backendScriptPath else {
-            completion(.failure(NSError(
-                domain: "LocalBackendClient",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Python or backend script not found"]
-            )))
+            completion(.failure(makeError("Python or backend script not found")))
             return
         }
 
@@ -263,170 +272,166 @@ final class LocalBackendClient: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.currentDirectoryURL = URL(fileURLWithPath: backendScriptPath).deletingLastPathComponent()
-            process.executableURL = URL(fileURLWithPath: pythonPath)
+            process.executableURL       = URL(fileURLWithPath: pythonPath)
+            // Model is read from backend storage — no need to pass it as an argument
             process.arguments = [
                 backendScriptPath,
-                "cli",
-                "transcribe",
+                "cli", "transcribe",
                 fileURL.path,
                 appName.isEmpty ? "unknown" : appName,
-                targetLanguage
+                targetLanguage,
             ]
             process.environment = ProcessInfo.processInfo.environment
 
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError  = errPipe
 
-            do {
-                try process.run()
-            } catch {
-                DispatchQueue.main.async {
-                    completion(.failure(error))
-                }
-                return
-            }
+            do    { try process.run() }
+            catch { DispatchQueue.main.async { completion(.failure(error)) }; return }
 
             var outputData = Data()
-            var errorData = Data()
-            let readGroup = DispatchGroup()
+            var errorData  = Data()
+            let readGroup  = DispatchGroup()
 
             readGroup.enter()
-            DispatchQueue.global(qos: .userInitiated).async {
-                outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            DispatchQueue.global().async {
+                outputData = outPipe.fileHandleForReading.readDataToEndOfFile()
                 readGroup.leave()
             }
-
             readGroup.enter()
-            DispatchQueue.global(qos: .userInitiated).async {
-                errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            DispatchQueue.global().async {
+                errorData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 readGroup.leave()
             }
 
             process.waitUntilExit()
             _ = readGroup.wait(timeout: .now() + self.timeout)
 
-            if process.terminationStatus != 0 && outputData.isEmpty {
-                process.terminate()
-                DispatchQueue.main.async {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient",
-                        code: -2,
-                        userInfo: [NSLocalizedDescriptionKey: "Transcription timed out"]
-                    )))
-                }
-                return
-            }
-
             let outputString = String(data: outputData, encoding: .utf8) ?? ""
             let errorString  = String(data: errorData,  encoding: .utf8) ?? ""
 
+            self.debugLog("transcribeAudio", script: backendScriptPath, args: process.arguments ?? [],
+                          out: outputString, err: errorString, status: process.terminationStatus)
+
             DispatchQueue.main.async {
                 let trimmed = outputString.trimmingCharacters(in: .whitespacesAndNewlines)
-
                 guard !trimmed.isEmpty else {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient",
-                        code: -4,
-                        userInfo: [NSLocalizedDescriptionKey: "No output from backend"]
+                    let detail = errorString.trimmingCharacters(in: .whitespacesAndNewlines)
+                    completion(.failure(self.makeError(
+                        detail.isEmpty ? "No output from backend" : "No output from backend:\n\(detail)"
                     )))
                     return
                 }
 
-                let lines = trimmed
-                    .components(separatedBy: .newlines)
+                let lines = trimmed.components(separatedBy: .newlines)
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
+                    .filter { !$0.hasPrefix("[env]") && !$0.hasPrefix("[co]") && !$0.hasPrefix("[agent]") && !$0.hasPrefix("[whispr]") }
 
-                guard let jsonLine = lines.last(where: { $0.hasPrefix("{") && $0.hasSuffix("}") }) else {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient",
-                        code: -6,
-                        userInfo: [NSLocalizedDescriptionKey: "No JSON in backend output: \(trimmed)"]
-                    )))
-                    return
-                }
-
-                guard let data = jsonLine.data(using: .utf8) else {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient",
-                        code: -7,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode JSON line"]
-                    )))
+                guard let jsonLine = lines.last(where: { $0.hasPrefix("{") && $0.hasSuffix("}") }),
+                      let data = jsonLine.data(using: .utf8)
+                else {
+                    completion(.failure(self.makeError("No JSON in output: \(trimmed)")))
                     return
                 }
 
                 do {
                     let response = try JSONDecoder().decode(BackendResponse.self, from: data)
-
                     if process.terminationStatus == 0 {
-                        completion(.success(response.output))
+                        let cost = self.parseTotalCost(from: errorString)
+                        completion(.success((text: response.output, cost: cost)))
                     } else {
-                        completion(.failure(NSError(
-                            domain: "LocalBackendClient",
-                            code: Int(process.terminationStatus),
-                            userInfo: [NSLocalizedDescriptionKey:
-                                errorString.isEmpty
-                                ? "Backend exited with code \(process.terminationStatus)"
-                                : errorString
-                            ]
+                        completion(.failure(self.makeError(
+                            errorString.isEmpty ? "Backend error \(process.terminationStatus)" : errorString
                         )))
                     }
                 } catch {
-                    completion(.failure(NSError(
-                        domain: "LocalBackendClient",
-                        code: -8,
-                        userInfo: [NSLocalizedDescriptionKey: "Invalid JSON: \(jsonLine)"]
-                    )))
+                    completion(.failure(self.makeError("Invalid JSON: \(jsonLine)")))
                 }
             }
         }
     }
 
     // =========================================================
-    // Language management
+    // Cost parsing
     // =========================================================
 
-    func syncLanguageToBackend(completion: ((Bool) -> Void)? = nil) {
-        guard let backendScriptPath else {
-            completion?(false)
-            return
-        }
+    /// Parse total USD cost from connectonion stderr output.
+    /// Lines look like: [co] ● gemini-3-flash-preview · 282 tok · $0.0003 · 0% ctx
+    /// We sum all $ amounts found across all agent runs in one transcription.
+    private func parseTotalCost(from stderr: String) -> Double? {
+        // Match $0.0000 patterns — only on [co] ● lines (completed agent calls)
+        let pattern = #"\[co\] ●[^\n]*\$([0-9]+\.[0-9]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range   = NSRange(stderr.startIndex..., in: stderr)
+        let matches = regex.matches(in: stderr, range: range)
+        guard !matches.isEmpty else { return nil }
 
-        let language = LanguageManager.shared.current
+        let total = matches.compactMap { match -> Double? in
+            guard let r = Range(match.range(at: 1), in: stderr) else { return nil }
+            return Double(stderr[r])
+        }.reduce(0, +)
 
-        runPythonCommand(
-            script: backendScriptPath,
-            arguments: ["cli", "set-language", language]
-        ) { result in
-            switch result {
-            case .success:  completion?(true)
-            case .failure:  completion?(false)
+        return total > 0 ? total : nil
+    }
+
+    struct BalanceResult {
+        let connectonionBalance : Double?
+        let connectonionUsed    : Double?
+        let openAIBalance       : Double?
+        let openAIPlan          : String?
+    }
+
+    func fetchBalance(completion: @escaping (BalanceResult?, String?) -> Void) {
+        guard let backendScriptPath else { completion(nil, "Backend not available"); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "get-balance"]) { result in
+            guard case .success(let output) = result,
+                  let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  json["ok"] as? Bool == true
+            else { completion(nil, "Request failed"); return }
+
+            var coBalance  : Double? = nil
+            var coUsed     : Double? = nil
+            var oaiBalance : Double? = nil
+            var oaiPlan    : String? = nil
+
+            if let co = json["connectonion"] as? [String: Any] {
+                coBalance = co["balance_usd"]    as? Double
+                coUsed    = co["total_cost_usd"] as? Double
             }
+            if let oai = json["openai"] as? [String: Any] {
+                oaiBalance = oai["balance_usd"] as? Double
+                oaiPlan    = oai["plan"] as? String ?? (oaiBalance == nil ? "Pay as you go" : nil)
+            }
+
+            completion(BalanceResult(
+                connectonionBalance: coBalance,
+                connectonionUsed:    coUsed,
+                openAIBalance:       oaiBalance,
+                openAIPlan:          oaiPlan
+            ), nil)
         }
     }
 
-    func fetchLanguageFromBackend(completion: @escaping (String?) -> Void) {
-        guard let backendScriptPath else {
-            completion(nil)
-            return
-        }
-
+    func syncLanguageToBackend(completion: ((Bool) -> Void)? = nil) {
+        guard let backendScriptPath else { completion?(false); return }
         runPythonCommand(
             script: backendScriptPath,
-            arguments: ["cli", "get-language"]
-        ) { result in
-            guard
-                case .success(let output) = result,
-                let data = output.data(using: .utf8),
-                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let lang = json["language"] as? String
-            else {
-                completion(nil)
-                return
-            }
+            arguments: ["cli", "set-language", LanguageManager.shared.current]
+        ) { result in completion?((try? result.get()) != nil) }
+    }
 
+    func fetchLanguageFromBackend(completion: @escaping (String?) -> Void) {
+        guard let backendScriptPath else { completion(nil); return }
+        runPythonCommand(script: backendScriptPath, arguments: ["cli", "get-language"]) { result in
+            guard case .success(let output) = result,
+                  let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let lang = json["language"] as? String
+            else { completion(nil); return }
             completion(lang)
         }
     }
@@ -439,54 +444,33 @@ final class LocalBackendClient: ObservableObject {
         guard let backendScriptPath else { return nil }
         return URL(fileURLWithPath: backendScriptPath)
             .deletingLastPathComponent()
-            .appendingPathComponent("snippets.py")
-            .path
+            .appendingPathComponent("snippets.py").path
     }
 
     func listSnippets(completion: @escaping ([[String: Any]]) -> Void) {
-        guard let script = snippetsScriptPath else {
-            completion([])
-            return
-        }
-
+        guard let script = snippetsScriptPath else { completion([]); return }
         runPythonCommand(script: script, arguments: ["cli", "list"]) { result in
-            guard case .success(let output) = result else {
-                completion([])
-                return
-            }
-
+            guard case .success(let output) = result else { completion([]); return }
             for line in output.components(separatedBy: .newlines) {
-                guard
-                    let data = line.data(using: .utf8),
-                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let snippets = json["snippets"] as? [[String: Any]]
+                guard let data     = line.data(using: .utf8),
+                      let json     = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let snippets = json["snippets"] as? [[String: Any]]
                 else { continue }
-
-                completion(snippets)
-                return
+                completion(snippets); return
             }
-
             completion([])
         }
     }
 
     func addSnippet(trigger: String, expansion: String, completion: @escaping (Bool) -> Void) {
-        guard let script = snippetsScriptPath else {
-            completion(false)
-            return
-        }
-
+        guard let script = snippetsScriptPath else { completion(false); return }
         runPythonCommand(script: script, arguments: ["cli", "add", trigger, expansion]) { result in
             completion((try? result.get()) != nil)
         }
     }
 
     func removeSnippet(trigger: String, completion: @escaping (Bool) -> Void) {
-        guard let script = snippetsScriptPath else {
-            completion(false)
-            return
-        }
-
+        guard let script = snippetsScriptPath else { completion(false); return }
         runPythonCommand(script: script, arguments: ["cli", "remove", trigger]) { result in
             completion((try? result.get()) != nil)
         }
@@ -500,78 +484,68 @@ final class LocalBackendClient: ObservableObject {
         guard let backendScriptPath else { return nil }
         return URL(fileURLWithPath: backendScriptPath)
             .deletingLastPathComponent()
-            .appendingPathComponent("agents", isDirectory: true)
-            .appendingPathComponent("dictionary_agent.py")
-            .path
+            .appendingPathComponent("agents/dictionary_agent.py").path
+    }
+
+    func runDictionaryUpdate(completion: @escaping (Result<DictionaryUpdateResult, Error>) -> Void) {
+        guard let script = dictionaryAgentPath else {
+            completion(.failure(makeError("dictionary_agent.py not found"))); return
+        }
+        runPythonCommand(script: script, arguments: ["cli", "update"]) { result in
+            switch result {
+            case .failure(let e): completion(.failure(e))
+            case .success(let output):
+                let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let jsonLine = trimmed.components(separatedBy: .newlines)
+                    .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+                    .last(where: { $0.hasPrefix("{") && $0.hasSuffix("}") }),
+                      let data = jsonLine.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else {
+                    completion(.success(DictionaryUpdateResult(added: [], updated: [], totalTerms: 0)))
+                    return
+                }
+                let added   = (json["added"]   as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
+                let updated = (json["updated"] as? [[String: Any]] ?? []).compactMap { DictionaryTerm(dict: $0) }
+                completion(.success(DictionaryUpdateResult(added: added, updated: updated, totalTerms: json["total_terms"] as? Int ?? 0)))
+            }
+        }
     }
 
     func listDictionaryTerms(completion: @escaping ([[String: Any]]) -> Void) {
-        guard let script = dictionaryAgentPath else {
-            completion([])
-            return
-        }
-
+        guard let script = dictionaryAgentPath else { completion([]); return }
         runPythonCommand(script: script, arguments: ["cli", "list"]) { result in
-            guard case .success(let output) = result else {
-                completion([])
-                return
-            }
+            guard case .success(let output) = result else { completion([]); return }
 
             func extractTerms(_ json: [String: Any]) -> [[String: Any]]? {
-                if let terms = json["terms"] as? [[String: Any]] { return terms }
-                if let out = json["output"] as? [String: Any],
-                   let terms = out["terms"] as? [[String: Any]] { return terms }
-                if let out = json["output"] as? [String: Any],
-                   let dict = out["dictionary"] as? [String: Any],
-                   let terms = dict["terms"] as? [[String: Any]] { return terms }
-                if let dict = json["dictionary"] as? [String: Any],
-                   let terms = dict["terms"] as? [[String: Any]] { return terms }
+                if let t = json["terms"] as? [[String: Any]] { return t }
+                if let o = json["output"] as? [String: Any], let t = o["terms"] as? [[String: Any]] { return t }
+                if let d = json["dictionary"] as? [String: Any], let t = d["terms"] as? [[String: Any]] { return t }
                 return nil
             }
 
             for line in output.components(separatedBy: .newlines) {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard
-                    trimmed.hasPrefix("{"),
-                    let data = trimmed.data(using: .utf8),
-                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let terms = extractTerms(json)
+                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard t.hasPrefix("{"),
+                      let data  = t.data(using: .utf8),
+                      let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let terms = extractTerms(json)
                 else { continue }
-
-                completion(terms)
-                return
+                completion(terms); return
             }
-
-            let fullOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let data = fullOutput.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let terms = extractTerms(json) {
-                completion(terms)
-                return
-            }
-
             completion([])
         }
     }
 
     func addDictionaryTerm(phrase: String, aliases: [String], completion: @escaping (Bool) -> Void) {
-        guard let script = dictionaryAgentPath else {
-            completion(false)
-            return
-        }
-
-        let aliasStr = aliases.joined(separator: ",")
-        runPythonCommand(script: script, arguments: ["cli", "add", phrase, aliasStr]) { result in
+        guard let script = dictionaryAgentPath else { completion(false); return }
+        runPythonCommand(script: script, arguments: ["cli", "add", phrase, aliases.joined(separator: ",")]) { result in
             completion((try? result.get()) != nil)
         }
     }
 
     func removeDictionaryTerm(phrase: String, completion: @escaping (Bool) -> Void) {
-        guard let script = dictionaryAgentPath else {
-            completion(false)
-            return
-        }
-
+        guard let script = dictionaryAgentPath else { completion(false); return }
         runPythonCommand(script: script, arguments: ["cli", "remove", phrase]) { result in
             completion((try? result.get()) != nil)
         }
@@ -582,69 +556,47 @@ final class LocalBackendClient: ObservableObject {
     // =========================================================
 
     func loadHistory(completion: @escaping ([[String: Any]]) -> Void) {
-        guard let backendScriptPath else {
-            completion([])
-            return
-        }
-
+        guard let backendScriptPath else { completion([]); return }
         runPythonCommand(script: backendScriptPath, arguments: ["cli", "get-history"]) { result in
-            guard case .success(let output) = result else {
-                completion([])
-                return
-            }
-
+            guard case .success(let output) = result else { completion([]); return }
             for line in output.components(separatedBy: .newlines) {
-                guard
-                    let data = line.data(using: .utf8),
-                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let items = json["items"] as? [[String: Any]]
+                guard let data  = line.data(using: .utf8),
+                      let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let items = json["items"] as? [[String: Any]]
                 else { continue }
-
-                completion(items)
-                return
+                completion(items); return
             }
-
             completion([])
         }
     }
 
     // =========================================================
-    // Data management — clear / reset
+    // Data management
     // =========================================================
 
     func clearHistory(completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "clear-history"]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "clear-history"]) { r in completion((try? r.get()) != nil) }
     }
 
     func clearDictionary(completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "clear-dictionary"]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "clear-dictionary"]) { r in completion((try? r.get()) != nil) }
     }
 
     func clearSnippets(completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "clear-snippets"]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "clear-snippets"]) { r in completion((try? r.get()) != nil) }
     }
 
     func resetProfile(completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "reset-profile"]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "reset-profile"]) { r in completion((try? r.get()) != nil) }
     }
 
     func resetAll(completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "reset-all"]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "reset-all"]) { r in completion((try? r.get()) != nil) }
     }
 
     // =========================================================
@@ -652,36 +604,22 @@ final class LocalBackendClient: ObservableObject {
     // =========================================================
 
     func isFirstLaunch(completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else {
-            completion(false)
-            return
-        }
-
+        guard let backendScriptPath else { completion(false); return }
         runPythonCommand(script: backendScriptPath, arguments: ["cli", "is-first-launch"]) { result in
-            guard
-                case .success(let output) = result,
-                let data = output.data(using: .utf8),
-                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let first = json["first_launch"] as? Bool
-            else {
-                completion(false)
-                return
-            }
-
+            guard case .success(let output) = result,
+                  let data  = output.data(using: .utf8),
+                  let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let first = json["first_launch"] as? Bool
+            else { completion(false); return }
             completion(first)
         }
     }
 
     func saveOnboardingProfile(_ profile: [String: Any], completion: @escaping (Bool) -> Void) {
-        guard
-            let backendScriptPath,
-            let jsonData = try? JSONSerialization.data(withJSONObject: profile),
-            let jsonStr = String(data: jsonData, encoding: .utf8)
-        else {
-            completion(false)
-            return
-        }
-
+        guard let backendScriptPath,
+              let jsonData = try? JSONSerialization.data(withJSONObject: profile),
+              let jsonStr  = String(data: jsonData, encoding: .utf8)
+        else { completion(false); return }
         runPythonCommand(script: backendScriptPath, arguments: ["cli", "save-profile", jsonStr]) { result in
             completion((try? result.get()) != nil)
         }
@@ -692,43 +630,27 @@ final class LocalBackendClient: ObservableObject {
     // =========================================================
 
     func listTextInsertions(completion: @escaping ([[String: Any]]) -> Void) {
-        guard let backendScriptPath else {
-            completion([])
-            return
-        }
-
+        guard let backendScriptPath else { completion([]); return }
         runPythonCommand(script: backendScriptPath, arguments: ["cli", "list-insertions"]) { result in
-            guard case .success(let output) = result else {
-                completion([])
-                return
-            }
-
+            guard case .success(let output) = result else { completion([]); return }
             for line in output.components(separatedBy: .newlines) {
-                guard
-                    let data = line.data(using: .utf8),
-                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let items = json["insertions"] as? [[String: Any]]
+                guard let data  = line.data(using: .utf8),
+                      let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let items = json["insertions"] as? [[String: Any]]
                 else { continue }
-
-                completion(items)
-                return
+                completion(items); return
             }
-
             completion([])
         }
     }
 
     func saveTextInsertion(label: String, value: String, completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "save-insertion", label, value]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "save-insertion", label, value]) { r in completion((try? r.get()) != nil) }
     }
 
     func removeTextInsertion(label: String, completion: @escaping (Bool) -> Void) {
-        guard let backendScriptPath else { completion(false); return }
-        runPythonCommand(script: backendScriptPath, arguments: ["cli", "remove-insertion", label]) { result in
-            completion((try? result.get()) != nil)
-        }
+        guard let s = backendScriptPath else { completion(false); return }
+        runPythonCommand(script: s, arguments: ["cli", "remove-insertion", label]) { r in completion((try? r.get()) != nil) }
     }
 }
