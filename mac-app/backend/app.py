@@ -16,14 +16,32 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from connectonion.address import load
-from connectonion import Agent, host, transcribe
+# ── Silence connectonion's stdout chatter before it imports ──────────────────
+# connectonion prints [env] and [agent] lines to stdout which breaks our JSON
+# output parsing in the Swift client. Redirect stdout temporarily during import,
+# then restore it so our own _exit_json() still works.
+import io as _io
+_real_stdout = sys.stdout
+sys.stdout = _io.StringIO()   # swallow any noise during connectonion import
+
+try:
+    from connectonion.address import load
+    from connectonion import Agent, host
+except Exception as _co_err:
+    sys.stdout = _real_stdout
+    print(f"[whispr] connectonion import failed: {_co_err}", file=sys.stderr)
+    raise
+finally:
+    sys.stdout = _real_stdout  # always restore, even on success
+# ─────────────────────────────────────────────────────────────────────────────
 
 from storage import (
     app_support_dir, now_ms, save_store,
     load_profile, save_profile, load_history, append_history,
-    get_target_language, set_target_language,
-    SUPPORTED_LANGUAGES,
+    get_target_language, set_target_language, SUPPORTED_LANGUAGES,
+    get_model, set_model, MODEL_OPTIONS, SUPPORTED_MODELS,
+    get_api_key, set_api_key, remove_api_key, has_api_key,
+    requires_api_key, load_env_into_os,
 )
 from agents.profile  import get_user_context, startup_init, invalidate_context_cache
 from agents.profile  import is_first_launch, complete_onboarding
@@ -42,7 +60,17 @@ CO_DIR   = BASE_DIR / ".co"
 # =========================================================
 
 def _transcribe_audio(audio_path: str) -> str:
-    return str(transcribe(audio_path)).strip()
+    from connectonion import transcribe
+    # connectonion.transcribe only supports Gemini (co/) models.
+    # If user has selected an OpenAI model, fall back to the default Gemini transcriber.
+    model = get_model()
+    if not model.startswith("co/"):
+        model = "co/gemini-3-flash-preview"
+    return transcribe(
+        audio_path,
+        prompt="Transcribe exactly as spoken. Output ONLY the transcribed words — no preamble, no labels, no phrases like 'Here is the transcription'.",
+        model=model,
+    ).strip()
 
 
 # =========================================================
@@ -117,7 +145,7 @@ def create_agent():
         return {"ok": True, "profile": load_profile()}
 
     agent = Agent(
-        model="gpt-5",
+        model=get_model(),
         name="whispr_orchestrator",
         system_prompt="You are Whispr. You orchestrate audio transcription and refinement.",
     )
@@ -126,6 +154,7 @@ def create_agent():
     return agent
 
 
+load_env_into_os()   # inject .env → os.environ before any agent runs
 startup_init()
 
 
@@ -258,6 +287,59 @@ if __name__ == "__main__":
         })
         invalidate_context_cache()
         _exit_json({"ok": True})
+
+    elif command == "set-model":
+        model = sys.argv[3] if len(sys.argv) > 3 else ""
+        ok = set_model(model)
+        _exit_json({"ok": ok, "model": model, "options": MODEL_OPTIONS}, 0 if ok else 1)
+
+    elif command == "get-model":
+        _exit_json({
+            "ok":              True,
+            "model":           get_model(),
+            "options":         MODEL_OPTIONS,
+            "requires_key":    requires_api_key(),
+            "has_key":         has_api_key("openai"),
+        })
+
+    elif command == "set-api-key":
+        # argv: cli set-api-key <key> [provider]
+        key      = sys.argv[3] if len(sys.argv) > 3 else ""
+        provider = sys.argv[4] if len(sys.argv) > 4 else "openai"
+        ok = set_api_key(key, provider)
+        _exit_json({"ok": ok}, 0 if ok else 1)
+
+    elif command == "get-api-key":
+        provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
+        _exit_json({"ok": True, "has_key": has_api_key(provider)})
+
+    elif command == "remove-api-key":
+        provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
+        ok = remove_api_key(provider)
+        _exit_json({"ok": ok})
+
+    elif command == "get-balance":
+        # Fetch connectonion credit balance via OpenOnion API
+        try:
+            import requests
+            api_key  = os.environ.get("OPENONION_API_KEY", "")
+            base_url = os.environ.get("OPENONION_BASE_URL", "https://oo.openonion.ai")
+            if not api_key:
+                _exit_json({"ok": False, "error": "OPENONION_API_KEY not set"})
+            auth_url = f"{base_url.rstrip('/')}/api/v1/auth/me"
+            resp     = requests.get(
+                auth_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data    = resp.json()
+                balance = data.get("balance_usd")
+                _exit_json({"ok": True, "balance_usd": balance, "raw": data})
+            else:
+                _exit_json({"ok": False, "error": f"HTTP {resp.status_code}"})
+        except Exception as e:
+            _exit_json({"ok": False, "error": str(e)})
 
     elif command == "calendar":
         text = sys.argv[3] if len(sys.argv) > 3 else "today"
