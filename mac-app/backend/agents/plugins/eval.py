@@ -13,9 +13,11 @@ Session keys:
 """
 from __future__ import annotations
 
+
 from connectonion import Agent
 
 from storage import get_target_language
+from storage import get_agent_model
 
 MAX_RETRIES = 2
 
@@ -43,7 +45,7 @@ def _get_last_user(messages: list) -> str:
 def _judge(expected: str, actual: str) -> tuple[str, str]:
     """Returns (verdict, reason) where verdict is PASS/PARTIAL/FAIL."""
     evaluator = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_eval_judge",
         system_prompt=(
             "Evaluate if the actual output meets the expected criteria.\n"
@@ -80,7 +82,7 @@ def generate_expected(agent) -> None:
     lang     = get_target_language()
 
     evaluator = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_eval_expected",
         system_prompt=(
             "Describe what a correct output looks like for a voice transcription assistant. "
