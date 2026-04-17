@@ -11,10 +11,20 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
+# ── sys.path fix MUST be before any local imports ────────────────────────────
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(_BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_ROOT))
+# ─────────────────────────────────────────────────────────────────────────────
+
 from connectonion.address import load
 from connectonion import Agent, host
 
-from storage import app_support_dir, storage_path, load_store, save_store, load_history
+from storage import app_support_dir, storage_path, load_store, save_store, load_history, get_agent_model, load_env_into_os
+
+# Load .env files so OPENAI_API_KEY and OPENONION_API_KEY are available
+# (this process is launched directly, not via app.py, so we must load manually)
+load_env_into_os()
 
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR   = BASE_DIR / ".co"
@@ -97,8 +107,8 @@ def should_update_dictionary() -> bool:
     if not path.exists() or not load_dictionary().get("terms"):
         return True
     try:
-        data     = json.loads(path.read_text(encoding="utf-8"))
-        elapsed  = time.time() - data.get("last_update", 0)
+        data      = json.loads(path.read_text(encoding="utf-8"))
+        elapsed   = time.time() - data.get("last_update", 0)
         new_items = get_new_history_since_last_update()
         if new_items and elapsed > 3600:
             return True
@@ -309,9 +319,6 @@ def _count_term_frequency(texts: List[str]) -> dict:
 
 
 def prune_stale_terms(all_history_texts: List[str]) -> Dict[str, Any]:
-    """Remove auto-added terms no longer found in recent history.
-    User-added terms (source == "user") are never touched.
-    """
     dictionary = load_dictionary()
     terms      = dictionary.get("terms", [])
     if not terms or not all_history_texts:
@@ -338,8 +345,8 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not texts:
         return {"added": [], "updated": [], "total_terms": len(load_dictionary().get("terms", []))}
 
-    freq     = _count_term_frequency(texts)
-    _COMMON  = {
+    freq    = _count_term_frequency(texts)
+    _COMMON = {
         "the","a","an","and","or","but","in","on","at","to","for","of","with",
         "is","was","are","were","be","been","i","you","he","she","we","they",
         "it","this","that","my","your","his","her","our","its","have","has",
@@ -369,7 +376,7 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     agent = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_dictionary_batch_updater",
         system_prompt=(
             "You are a dictionary term extractor for Whispr, a voice transcription app.\n"
@@ -443,7 +450,7 @@ def run_batched_update(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def create_agent() -> Agent:
     agent = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_dictionary_agent",
         system_prompt=(
             "You are Whispr's personal dictionary agent. "
@@ -476,8 +483,8 @@ if __name__ == "__main__":
     command = sys.argv[2] if len(sys.argv) > 2 else "update"
 
     if command == "update":
-        force       = "--force" in sys.argv
-        all_texts   = [
+        force      = "--force" in sys.argv
+        all_texts  = [
             str(i.get("final_text", "")).strip()
             for i in load_history().get("items", [])[-200:]
             if str(i.get("final_text", "")).strip()
@@ -504,12 +511,12 @@ if __name__ == "__main__":
         mark_dictionary_updated()
         _exit_json({
             "ok": True, "skipped": False,
-            "new_records_found":  len(new_items),
-            "records_processed":  min(limit, len(new_items)),
-            "added":              result["added"],
-            "updated":            result["updated"],
-            "pruned":             prune_result.get("removed", []),
-            "total_terms":        result["total_terms"],
+            "new_records_found": len(new_items),
+            "records_processed": min(limit, len(new_items)),
+            "added":             result["added"],
+            "updated":           result["updated"],
+            "pruned":            prune_result.get("removed", []),
+            "total_terms":       result["total_terms"],
         })
 
     elif command == "list":
