@@ -14,6 +14,10 @@ final class AppManager: ObservableObject {
 
     @Published var appStatus: AppStatus = .idle
     @Published var lastOutputText: String = ""
+    @Published var lastCost: Double? = nil
+    @Published var lastConnectonionBalance: Double? = nil
+    @Published var lastOpenAIBalance: Double? = nil
+    @Published var lastOpenAIPlan: String? = nil
     @Published var currentActiveApp: String = "Unknown"
 
     private var targetAppPID: pid_t = 0
@@ -133,10 +137,19 @@ final class AppManager: ObservableObject {
             guard let self else { return }
             DispatchQueue.main.async {
                 switch result {
-                case .success(let text):
-                    self.lastOutputText = text
+                case .success(let response):
+                    self.lastOutputText = response.text
+                    self.lastCost       = response.cost
                     self.updateAppStatus(.idle)
-                    self.pasteTextToTargetApp(text: text)
+                    self.pasteTextToTargetApp(text: response.text)
+                    // Fetch balance in background after every transcription
+                    self.localBackendClient.fetchBalance { balResult, _ in
+                        DispatchQueue.main.async {
+                            self.lastConnectonionBalance = balResult?.connectonionBalance
+                            self.lastOpenAIBalance       = balResult?.openAIBalance
+                            self.lastOpenAIPlan          = balResult?.openAIPlan
+                        }
+                    }
                 case .failure(let error):
                     self.updateAppStatus(.error)
                     self.showErrorAlert(message: "Transcription failed: \(error.localizedDescription)")
