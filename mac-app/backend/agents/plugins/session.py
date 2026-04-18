@@ -9,6 +9,7 @@ of what was said and returned before — enabling continuations like:
 """
 from __future__ import annotations
 
+
 import re
 
 _SESSION: list[dict] = []
