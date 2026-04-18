@@ -13,7 +13,7 @@ import threading
 
 from connectonion import Agent
 
-from storage import load_profile, save_profile, load_history, SUPPORTED_LANGUAGES
+from storage import load_profile, save_profile, load_history, SUPPORTED_LANGUAGES, get_agent_model
 
 _CONTEXT_CACHE : str  = ""
 _CONTEXT_READY : bool = False
@@ -145,7 +145,7 @@ def _learn() -> None:
     sample = "\n".join(f"- {t[:120]}" for t in texts[-30:])
 
     agent = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_profile_learner",
         system_prompt=(
             "You are a usage-pattern analyser for a voice transcription app. "
