@@ -17,7 +17,7 @@ import re
 
 from connectonion import Agent, after_user_input, before_llm, on_complete
 
-from storage import apply_dictionary_corrections
+from storage import apply_dictionary_corrections, get_agent_model
 from agents.profile          import inject_profile, update_profile_background
 from agents.dictionary_agent import inject_dictionary, update_dictionary_background
 from agents.plugins.lang     import inject_language
@@ -67,7 +67,7 @@ def run(text: str, app_name: str) -> str:
         return cleaned
 
     agent = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_refiner",
         system_prompt=(
             "You are a voice transcription cleaner.\n"
