@@ -4,44 +4,53 @@ agents/refiner.py — Voice transcription cleaning and formatting subagent.
 Events:
   after_user_input → inject_profile      (user style + habits)
   after_user_input → inject_dictionary   (known terms to fix)
-  after_user_input → generate_expected   (eval plugin)
   before_llm       → inject_language     (language plugin)
+  on_complete      → apply_snippets      (hardcode string replace)
   on_complete      → update_dictionary_background (debounced, daemon)
   on_complete      → update_profile_background    (debounced, daemon)
   on_complete      → show_summary        (visibility plugin)
-  on_complete      → evaluate_output     (eval plugin)
 """
 from __future__ import annotations
 
 import re
+import sys
+import io as _io
 
+_real = sys.stdout
+sys.stdout = _io.StringIO()
 from connectonion import Agent, after_user_input, before_llm, on_complete
+sys.stdout = _real
 
-from storage import apply_dictionary_corrections, get_agent_model
-from agents.profile          import inject_profile, update_profile_background
+from storage import apply_dictionary_corrections
+from agents.profile   import inject_profile, update_profile_background
 from agents.dictionary_agent import inject_dictionary, update_dictionary_background
-from agents.plugins.lang     import inject_language
+from agents.plugins.lang    import inject_language
 from agents.plugins.session  import inject_session, session_remember
 from agents.plugins.visibility import show_summary
-from agents.plugins.eval       import generate_expected, evaluate_and_retry
 
 
-def _apply_snippets(text: str) -> str:
-    """Post-process — expand snippet triggers in the final output. No LLM."""
+def _apply_snippets(agent) -> None:
+    """on_complete — hardcode snippet expansion. No LLM, no agent."""
     from snippets import load_snippets
-    for item in load_snippets().get("snippets", []):
-        if not item.get("enabled", True):
-            continue
-        trigger   = str(item.get("trigger", "")).strip()
-        expansion = str(item.get("expansion", "")).strip()
-        if trigger and expansion:
-            text = re.sub(
-                rf"\b{re.escape(trigger)}\b", expansion, text, flags=re.IGNORECASE
-            )
-    return text
+    messages = agent.current_session.get("messages", [])
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            text = str(msg["content"])
+            for item in load_snippets().get("snippets", []):
+                if not item.get("enabled", True):
+                    continue
+                trigger   = str(item.get("trigger", "")).strip()
+                expansion = str(item.get("expansion", "")).strip()
+                if trigger and expansion:
+                    text = re.sub(
+                        rf"\b{re.escape(trigger)}\b", expansion, text, flags=re.IGNORECASE
+                    )
+            msg["content"] = text
+            break
 
 
 def _set_intent(agent) -> None:
+    """after_user_input — tag session intent for visibility plugin."""
     agent.current_session["whispr_intent"] = "refiner"
 
 
@@ -61,50 +70,46 @@ def _quick_clean(text: str) -> str:
 def run(text: str, app_name: str) -> str:
     """Clean and format raw transcribed speech."""
     cleaned = _quick_clean(text)
-    has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+    has_cjk = bool(re.search(r"[一-鿿぀-ヿ가-힯]", text))
 
-    if not has_cjk and len(cleaned.split()) < 5:
+    # Bypass LLM only for very short English — single words or two-word phrases
+    if not has_cjk and len(cleaned.split()) < 3:
         return cleaned
 
     agent = Agent(
-        model=get_agent_model(),
+        model="gpt-5.4",
         name="whispr_refiner",
         system_prompt=(
-            "You are a voice transcription cleaner.\n"
+            "You are a voice transcription assistant. "
+            "You receive raw text that was automatically transcribed from a user's audio recording. "
+            "Your job is to clean and format that transcribed text — nothing else.\n"
             "1. Fix phonetic mishearings using the known terms in your context.\n"
-            "2. Remove stutters, false starts, filler words "
-            "(uh, um, like, so, basically, you know, right, okay so).\n"
-            "3. Format as a numbered list when ANY of these apply:\n"
+            "2. Format as a numbered list when ANY of these apply:\n"
             "   a) Explicit list speech: 'point one/two', 'first/second/third', 'number one/two'\n"
             "   b) Long text (4+ sentences) with multiple distinct keypoints, topics, or action items\n"
             "   c) Instructions or steps where sequence matters\n"
             "   For prose sentences that flow naturally together, keep as paragraph — do not force a list.\n"
-            "4. Fix punctuation and capitalisation.\n"
-            "5. Format for the active app in your context:\n"
+            "3. Fix punctuation and capitalisation.\n"
+            "4. Format for the active app in your context:\n"
             "   - Mail → complete email with Subject:, greeting, body, sign-off\n"
             "   - Slack/Teams → short conversational message\n"
             "   - Notes/Docs → clean paragraphs or lists as appropriate\n"
             "   - Code editor → technical language, preserve code terms exactly\n"
-            "6. Match the user's preferred writing style from their profile.\n"
-            "Output ONLY the final cleaned text.\n"
-            "NEVER add preamble like \"A cleaned-up version is:\", \"Here is the text:\", \"Certainly\".\n"
-            "NEVER offer follow-up suggestions like \"I can also make it more formal\".\n"
-            "NEVER explain what you did. First word of output must be first word of the actual content."
+            "5. Match the user's preferred writing style from their profile.\n"
+            "Output ONLY the cleaned transcription text."
         ),
         on_events=[
             after_user_input(_set_intent),
             after_user_input(inject_session),
             after_user_input(inject_profile),
             after_user_input(inject_dictionary),
-            after_user_input(generate_expected),
             before_llm(inject_language),
+            on_complete(_apply_snippets),
             on_complete(update_dictionary_background),
             on_complete(update_profile_background),
             on_complete(show_summary),
-            on_complete(evaluate_and_retry),
         ],
     )
 
     prompt = f"[App: {app_name}]\n{cleaned}" if app_name and app_name != "unknown" else cleaned
-    result = str(agent.input(prompt)).strip().strip('"').strip("'")
-    return _apply_snippets(result)
+    return str(agent.input(prompt)).strip().strip('"').strip("'")
