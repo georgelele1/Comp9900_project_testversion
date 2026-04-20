@@ -1,7 +1,10 @@
 """
 agents/intent.py — LLM-based intent detection.
 
-Classifies intent into: calendar | knowledge | refine
+Single LLM call classifies intent into: calendar | knowledge | refine
+
+No regex Layer 1 — the LLM handles all cases including edge cases like
+"what is my exam date" (calendar) vs "what is Newton's law" (knowledge).
 
 Followup detection uses shared session context so consecutive questions
 route correctly based on previous exchange type.
@@ -9,15 +12,12 @@ route correctly based on previous exchange type.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-
-# Ensure backend root is on sys.path when run from agents/ subdirectory
-_BACKEND_ROOT = Path(__file__).resolve().parent.parent
-if str(_BACKEND_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_ROOT))
-
+import io as _io
+from storage import get_agent_model
+_real = sys.stdout
+sys.stdout = _io.StringIO()
 from connectonion import Agent
-from storage import get_model, get_agent_model
+sys.stdout = _real
 
 
 def _classify(text: str, session_context: str = "") -> str:
@@ -27,22 +27,24 @@ def _classify(text: str, session_context: str = "") -> str:
         model=get_agent_model(),
         name="whispr_intent_classifier",
         system_prompt=(
-            "You classify voice transcriptions for a voice assistant.\n\n"
-            "STEP 1 — Analyse the sentence structure:\n"
-            "  - Is it a question or a retrieval request? (yes/no)\n"
-            "  - What is the subject — personal schedule/events, world knowledge, or text to dictate?\n"
-            "  - Is there an explicit intent to look something up, or is the user stating/dictating?\n\n"
-            "STEP 2 — Apply these rules in order:\n"
-            "  calendar  → question/retrieval AND subject is the user's own schedule, events, "
-            "appointments, or time slots. Both must be true.\n"
-            "  knowledge → question or request for factual/conceptual information about the world "
-            "that does not depend on the user's personal data.\n"
-            "  refine    → everything else: statements, dictation, messages, names, notes, "
-            "short phrases, or anything where intent is unclear. This is the default.\n\n"
-            "STEP 3 — Output only the label.\n\n"
-            "Use recent conversation to resolve ambiguous continuations.\n"
+            "Classify this voice transcription into exactly one label:\n\n"
+            "  calendar  — anything about the user's own schedule, events, appointments,\n"
+            "              exams, deadlines, meetings, or asking when something is.\n"
+            "              Examples: 'what is my exam date', 'when is my dentist',\n"
+            "              'do I have anything today', 'search my calendar for COMP9417'\n\n"
+            "  knowledge — asking a factual question, wanting an explanation, definition,\n"
+            "              formula, concept, or how something works.\n"
+            "              Examples: 'what is Newton's law', 'explain TCP vs UDP',\n"
+            "              'give me the formula for kinetic energy'\n\n"
+            "  refine    — dictating text to clean up, format, translate, or send.\n"
+            "              Also continuations of previous dictation.\n"
+            "              Examples: 'send an email to the team', 'translate that to Chinese',\n"
+            "              'and also mention the deadline'\n\n"
+            "Use the recent conversation to resolve ambiguous continuations.\n"
+            "If the previous response was a knowledge answer and this continues that topic,\n"
+            "classify as knowledge. If it continues dictation, classify as refine."
             f"{session_hint}\n\n"
-            "Reply ONLY with one word: calendar, knowledge, or refine."
+            "Reply ONLY with the label. No explanation."
         ),
     )
     result = str(agent.input(text)).strip().lower()
@@ -51,19 +53,25 @@ def _classify(text: str, session_context: str = "") -> str:
 
 def detect_intent(text: str) -> str:
     """Returns: 'calendar' | 'knowledge' | 'refine'"""
-    from agents.plugins.session import get_session_context, is_followup, _SESSION
+    from agents.plugins.session import get_session_context, is_followup, _load
 
-    if is_followup(text) and _SESSION:
-        for msg in reversed(_SESSION):
+    # Fast-path for obvious followups — check session to decide which agent
+    session = _load()
+    if is_followup(text) and session:
+        for msg in reversed(session):
             if msg["role"] == "assistant":
                 content = msg["content"]
+                # If previous answer looks like knowledge, continue with knowledge
                 if len(content) > 100 or any(
-                    #keyward in content
                     kw in content.lower() for kw in
                     ["formula", "equation", "defined as", "refers to", "is a type",
                      "algorithm", "protocol", "theorem", "law of", "concept"]
                 ):
+                    print("[intent] followup → knowledge", file=sys.stderr)
                     return "knowledge"
+                print("[intent] followup → refine", file=sys.stderr)
                 return "refine"
 
-    return _classify(text, get_session_context())
+    intent = _classify(text, get_session_context())
+    print(f"[intent] LLM → {intent}", file=sys.stderr)
+    return intent

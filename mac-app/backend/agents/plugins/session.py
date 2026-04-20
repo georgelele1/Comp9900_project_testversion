@@ -2,19 +2,22 @@
 agents/plugins/session.py — Shared session memory across all Whispr agents.
 
 Persists to disk so context survives across separate CLI process invocations.
-Each transcription is a new process — without disk persistence the session
-resets every time and context-aware continuations never work.
-
-Session file: ~/Library/Application Support/Whispr/session.json
+Uses a module-level cache so the file is read once per process, not on every call.
+Session expires after 60 minutes of inactivity.
 """
 from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
-_SESSION_MAX  = 6      # keep last 3 exchanges (6 messages)
-_CONTENT_MAX  = 600    # chars per message — enough for full sentences
+SESSION_TTL_SECONDS = 60 * 60  # 60 minutes
+_SESSION_MAX        = 6        # last 3 exchanges (6 messages)
+_CONTENT_MAX        = 600      # chars per message
+
+# Module-level cache — loaded once per process on first access
+_cache: list[dict] | None = None
 
 
 def _session_path() -> Path:
@@ -30,47 +33,62 @@ def _session_path() -> Path:
     return base / "session.json"
 
 
-SESSION_TTL_HOURS = 1  # session expires after 60 minutes of inactivity
-
-
 def _load() -> list[dict]:
+    """Load session from cache, falling back to disk on first access.
+    Creates the file if it does not exist yet.
+    """
+    global _cache
+    if _cache is not None:
+        return _cache
+
     path = _session_path()
+
     if not path.exists():
-        return []
+        # First launch — create an empty session file
+        _save_to_disk([])
+        _cache = []
+        return _cache
+
     try:
-        import time
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
-            return []
-        # Expire session if inactive for more than TTL
-        last_updated = raw.get("updated_at", 0)
-        if time.time() - last_updated > SESSION_TTL_HOURS * 3600:
-            return []
-        return raw.get("messages", [])
+            _cache = []
+            return _cache
+        # Expire if idle for more than TTL
+        if time.time() - raw.get("updated_at", 0) > SESSION_TTL_SECONDS:
+            _save_to_disk([])
+            _cache = []
+            return _cache
+        _cache = raw.get("messages", [])
     except Exception:
-        return []
+        _cache = []
+
+    return _cache
 
 
-def _save(session: list[dict]) -> None:
+def _save_to_disk(messages: list[dict]) -> None:
+    """Write session to disk with current timestamp."""
     try:
-        import time
         _session_path().write_text(
-            json.dumps({"updated_at": time.time(), "messages": session}, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+            json.dumps({"updated_at": time.time(), "messages": messages},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
     except Exception:
         pass
 
 
 def session_remember(raw: str, output: str) -> None:
-    """Store a completed exchange — persisted to disk immediately."""
+    """Store a completed exchange — updates cache and persists to disk."""
+    global _cache
     if not raw.strip() or not output.strip():
         return
     session = _load()
     session.append({"role": "user",      "content": raw.strip()[:_CONTENT_MAX]})
     session.append({"role": "assistant", "content": output.strip()[:_CONTENT_MAX]})
     session = session[-_SESSION_MAX:]
-    _save(session)
+    _cache = session
+    _save_to_disk(session)
 
 
 def get_session_context() -> str:
@@ -109,5 +127,7 @@ def inject_session(agent) -> None:
 
 
 def clear_session() -> None:
-    """Clear session history — called on reset-all."""
-    _save([])
+    """Clear session — called on reset-all."""
+    global _cache
+    _cache = []
+    _save_to_disk([])
