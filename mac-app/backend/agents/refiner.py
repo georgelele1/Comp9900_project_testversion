@@ -5,7 +5,7 @@ Events:
   after_user_input → inject_profile      (user style + habits)
   after_user_input → inject_dictionary   (known terms to fix)
   before_llm       → inject_language     (language plugin)
-  on_complete      → apply_snippets      (hardcode string replace)
+  on_complete      → apply_snippets      (applied to return value, not on_complete)
   on_complete      → update_dictionary_background (debounced, daemon)
   on_complete      → update_profile_background    (debounced, daemon)
   on_complete      → show_summary        (visibility plugin)
@@ -29,24 +29,29 @@ from agents.plugins.session  import inject_session, session_remember
 from agents.plugins.visibility import show_summary
 
 
-def _apply_snippets(agent) -> None:
-    """on_complete — hardcode snippet expansion. No LLM, no agent."""
+def _apply_snippets(text: str) -> str:
+    """Post-process final output — expand trigger words in-place.
+    Appends expansion in parentheses so the original word is preserved.
+    Applied directly to the return value, not via on_complete.
+    """
     from snippets import load_snippets
-    messages = agent.current_session.get("messages", [])
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant":
-            text = str(msg["content"])
-            for item in load_snippets().get("snippets", []):
-                if not item.get("enabled", True):
-                    continue
-                trigger   = str(item.get("trigger", "")).strip()
-                expansion = str(item.get("expansion", "")).strip()
-                if trigger and expansion:
-                    text = re.sub(
-                        rf"\b{re.escape(trigger)}\b", expansion, text, flags=re.IGNORECASE
-                    )
-            msg["content"] = text
-            break
+    for item in load_snippets().get("snippets", []):
+        if not item.get("enabled", True):
+            continue
+        trigger   = str(item.get("trigger", "")).strip()
+        expansion = str(item.get("expansion", "")).strip()
+        if trigger and expansion:
+            # Use lookahead/lookbehind instead of \b so multi-word
+            # triggers like "zoom link" match correctly across spaces.
+            pattern = rf"(?<![\w]){re.escape(trigger)}(?![\w])"
+            escaped_expansion = expansion.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            text = re.sub(
+                pattern,
+                rf"\g<0> ({escaped_expansion})",
+                text,
+                flags=re.IGNORECASE,
+            )
+    return text
 
 
 def _set_intent(agent) -> None:
@@ -104,7 +109,6 @@ def run(text: str, app_name: str) -> str:
             after_user_input(inject_profile),
             after_user_input(inject_dictionary),
             before_llm(inject_language),
-            on_complete(_apply_snippets),
             on_complete(update_dictionary_background),
             on_complete(update_profile_background),
             on_complete(show_summary),
@@ -112,4 +116,5 @@ def run(text: str, app_name: str) -> str:
     )
 
     prompt = f"[App: {app_name}]\n{cleaned}" if app_name and app_name != "unknown" else cleaned
-    return str(agent.input(prompt)).strip().strip('"').strip("'")
+    result = str(agent.input(prompt)).strip().strip('"').strip("'")
+    return _apply_snippets(result)
