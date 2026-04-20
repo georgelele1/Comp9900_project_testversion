@@ -22,6 +22,11 @@ final class AppManager: ObservableObject {
 
     private var targetAppPID: pid_t = 0
 
+    // MARK: - Dev timing (remove before release)
+    #if DEBUG
+    private var _devTranscribeStart: Date?
+    #endif
+
     // MARK: - Init
 
     func initialize() {
@@ -128,6 +133,12 @@ final class AppManager: ObservableObject {
             return
         }
 
+        // ── DEV: start timing from here (recording just finished) ──
+        #if DEBUG
+        _devTranscribeStart = Date()
+        #endif
+        // ────────────────────────────────────────────────────────────
+
         updateAppStatus(.processing)
 
         localBackendClient.transcribeAudio(
@@ -136,6 +147,17 @@ final class AppManager: ObservableObject {
         ) { [weak self] result in
             guard let self else { return }
             DispatchQueue.main.async {
+
+                // ── DEV: print elapsed time ──────────────────────────
+                #if DEBUG
+                if let start = self._devTranscribeStart {
+                    let elapsed = Date().timeIntervalSince(start)
+                    print(String(format: "[DEV] ⏱ transcription round-trip: %.2fs", elapsed))
+                    self._devTranscribeStart = nil
+                }
+                #endif
+                // ────────────────────────────────────────────────────
+
                 switch result {
                 case .success(let response):
                     self.lastOutputText = response.text
