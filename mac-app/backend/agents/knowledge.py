@@ -21,7 +21,7 @@ _real = sys.stdout
 sys.stdout = _io.StringIO()
 from connectonion import Agent, after_user_input, before_llm, on_complete
 sys.stdout = _real
-
+from storage import get_agent_model
 from agents.profile   import inject_profile, update_profile_background
 from agents.dictionary_agent import inject_dictionary
 from agents.plugins.lang    import inject_language
@@ -71,7 +71,7 @@ def run(text: str) -> str:
     session_hint = f"\n\nConversation so far:\n{session}" if session else ""
 
     agent = Agent(
-        model="gpt-5.4",
+        model=get_agent_model(),
         name="whispr_knowledge",
         system_prompt=(
             "You are a universal knowledge assistant covering all domains: "
