@@ -2,7 +2,7 @@ import SwiftUI
 
 struct APIKeysView: View {
 
-    @State private var selectedModel      : String  = Config.defaultModel
+    @State private var selectedModel      : String  = AppManager.shared.localBackendClient.activeModel
     @State private var apiKeyInput        : String  = ""
     @State private var hasStoredKey       : Bool    = false
     @State private var isLoadingModel     : Bool    = false
@@ -266,7 +266,9 @@ struct APIKeysView: View {
         isLoadingModel = true
         backendClient?.fetchModelFromBackend { model in
             DispatchQueue.main.async {
-                self.selectedModel  = model ?? Config.defaultModel
+                // Fix: fall back to activeModel instead of defaultModel so
+                // the picker never resets to Gemini if the backend returns nil
+                self.selectedModel  = model ?? AppManager.shared.localBackendClient.activeModel
                 self.isLoadingModel = false
             }
         }
@@ -298,6 +300,11 @@ struct APIKeysView: View {
                 if success {
                     self.hasStoredKey = true
                     self.apiKeyInput  = ""
+                    // Fix: re-persist the selected OpenAI model after saving the key
+                    // so the backend doesn't silently revert to its default
+                    if Config.requiresAPIKey(self.selectedModel) {
+                        self.backendClient?.setModelOnBackend(self.selectedModel) { _ in }
+                    }
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.statusMessage = "" }
             }
