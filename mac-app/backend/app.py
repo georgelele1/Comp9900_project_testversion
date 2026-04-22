@@ -56,7 +56,9 @@ from storage import (
     app_support_dir, now_ms, load_store, save_store,
     load_profile, save_profile, load_history, append_history,
     get_target_language, set_target_language,
-    SUPPORTED_LANGUAGES,
+    get_model, set_model, get_agent_model,
+    get_api_key, set_api_key, remove_api_key, has_api_key,
+    SUPPORTED_LANGUAGES, SUPPORTED_MODELS, MODEL_OPTIONS,
 )
 from agents.profile  import get_user_context, startup_init, invalidate_context_cache
 from agents.profile  import is_first_launch, complete_onboarding
@@ -83,7 +85,7 @@ def _transcribe_audio(audio_path: str) -> str:
 
     def _clean(raw: str) -> str:
         raw = re.sub(
-            r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:ï¼]*[:ï¼]\s*",
+            r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:ï¼]*[:ï¼]\s*",
             "", raw, flags=re.IGNORECASE | re.DOTALL,
         ).strip()
         raw = re.sub(
@@ -192,7 +194,7 @@ def get_profile():
 
 def create_agent():
     agent = Agent(
-        model="gpt-5",
+        model=get_agent_model(),   # reads from storage instead of hardcoded "gpt-5"
         name="whispr_orchestrator",
         system_prompt="You are Whispr. You orchestrate audio transcription and refinement.",
     )
@@ -251,6 +253,70 @@ if __name__ == "__main__":
 
     elif command == "get-language":
         _exit_json({"ok": True, "language": get_target_language(), "supported": SUPPORTED_LANGUAGES})
+
+    # ── Model management ──────────────────────────────────
+
+    elif command == "get-model":
+        _exit_json({"ok": True, "model": get_model(), "supported": SUPPORTED_MODELS})
+
+    elif command == "set-model":
+        model = sys.argv[3] if len(sys.argv) > 3 else ""
+        ok = set_model(model)
+        _exit_json({"ok": ok, "model": get_model()}, 0 if ok else 1)
+
+    # ── API key management ────────────────────────────────
+
+    elif command == "get-api-key":
+        provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
+        _exit_json({"ok": True, "has_key": has_api_key(provider), "provider": provider})
+
+    elif command == "set-api-key":
+        key      = sys.argv[3] if len(sys.argv) > 3 else ""
+        provider = sys.argv[4] if len(sys.argv) > 4 else "openai"
+        ok = set_api_key(key, provider)
+        _exit_json({"ok": ok}, 0 if ok else 1)
+
+    elif command == "remove-api-key":
+        provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
+        ok = remove_api_key(provider)
+        _exit_json({"ok": ok}, 0 if ok else 1)
+
+    # ── Balance ───────────────────────────────────────────
+
+    elif command == "get-balance":
+        result: Dict[str, Any] = {"ok": True}
+
+        # Connectonion balance — read from connectonion balance API if available
+        try:
+            from connectonion import get_balance as _co_balance
+            co = _co_balance()
+            result["connectonion"] = {
+                "balance_usd":    co.get("balance_usd") or co.get("balance"),
+                "total_cost_usd": co.get("total_cost_usd") or co.get("used"),
+            }
+        except Exception:
+            result["connectonion"] = {"balance_usd": None, "total_cost_usd": None}
+
+        # OpenAI balance — only attempt if key exists
+        if has_api_key("openai"):
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/dashboard/billing/credit_grants",
+                    headers={"Authorization": f"Bearer {get_api_key('openai')}"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read())
+                result["openai"] = {
+                    "balance_usd": data.get("total_available"),
+                    "plan": None,
+                }
+            except Exception:
+                result["openai"] = {"balance_usd": None, "plan": "Pay as you go"}
+        else:
+            result["openai"] = {"balance_usd": None, "plan": None}
+
+        _exit_json(result)
 
     elif command == "set-profile":
         name         = sys.argv[3] if len(sys.argv) > 3 else ""
