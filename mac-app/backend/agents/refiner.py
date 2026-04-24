@@ -24,9 +24,10 @@ sys.stdout = _real
 from storage import apply_dictionary_corrections, get_agent_model
 from agents.profile   import inject_profile, update_profile_background
 from agents.dictionary_agent import inject_dictionary, update_dictionary_background
-from agents.plugins.lang    import inject_language
-from agents.plugins.session  import inject_session, session_remember
+from agents.plugins.lang       import inject_language
+from agents.plugins.session    import inject_session, session_remember
 from agents.plugins.visibility import show_summary
+from agents.plugins.eval       import generate_expected, evaluate_and_retry
 
 
 def _apply_snippets(text: str) -> str:
@@ -111,7 +112,9 @@ def run(text: str, app_name: str) -> str:
             after_user_input(inject_session),
             after_user_input(inject_profile),
             after_user_input(inject_dictionary),
+            after_user_input(generate_expected),
             before_llm(inject_language),
+            on_complete(evaluate_and_retry),
             on_complete(update_dictionary_background),
             on_complete(update_profile_background),
             on_complete(show_summary),

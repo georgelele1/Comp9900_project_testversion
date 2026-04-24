@@ -24,9 +24,10 @@ sys.stdout = _real
 from storage import get_agent_model
 from agents.profile   import inject_profile, update_profile_background
 from agents.dictionary_agent import inject_dictionary
-from agents.plugins.lang    import inject_language
+from agents.plugins.lang     import inject_language
 from agents.plugins.session  import inject_session, session_remember, is_followup as session_followup
 from agents.plugins.visibility import show_summary
+from agents.plugins.eval     import generate_expected, evaluate_and_retry
 
 _SESSION: list = []
 _SESSION_MAX   = 6
@@ -89,7 +90,9 @@ def run(text: str) -> str:
             after_user_input(inject_session),
             after_user_input(inject_profile),
             after_user_input(inject_dictionary),
+            after_user_input(generate_expected),
             before_llm(inject_language),
+            on_complete(evaluate_and_retry),
             on_complete(update_profile_background),
             on_complete(show_summary),
         ],
