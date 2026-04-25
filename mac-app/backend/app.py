@@ -1,33 +1,5 @@
 """
 app.py — Whispr main pipeline orchestrator.
-
-Responsibilities:
-  - Transcribe audio → raw text
-  - Detect intent (2-layer: regex → LLM)
-  - Dispatch to the right subagent
-  - Append to history
-  - Expose CLI commands
-
-All context injection, language, eval, and background updates
-are handled inside each subagent via on_events — not here.
-
-File layout:
-  app.py
-  dictionary_agent.py
-  snippets.py
-  storage.py
-  gcalendar.py
-  agents/
-    profile.py
-    intent.py
-    refiner.py
-    knowledge.py
-    calendar.py
-  plugins/
-    __init__.py
-    language.py
-    visibility.py
-    eval.py
 """
 from __future__ import annotations
 
@@ -39,11 +11,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-import sys as _sys
-from pathlib import Path as _Path
-_backend_root = str(_Path(__file__).resolve().parent)
-if _backend_root not in _sys.path:
-    _sys.path.insert(0, _backend_root)
+_backend_root = str(Path(__file__).resolve().parent)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 _real_stdout, _real_stderr = sys.stdout, sys.stderr
 sys.stdout = sys.stderr = _io.StringIO()
@@ -53,20 +23,19 @@ sys.stdout = _real_stdout
 sys.stderr = _real_stderr
 
 from storage import (
-    app_support_dir, now_ms, load_store, save_store,
+    app_support_dir, now_ms, save_store,
     load_profile, save_profile, load_history, append_history,
     get_target_language, set_target_language,
     get_model, set_model, get_agent_model,
     get_api_key, set_api_key, remove_api_key, has_api_key,
-    SUPPORTED_LANGUAGES, SUPPORTED_MODELS, MODEL_OPTIONS,
+    SUPPORTED_LANGUAGES, SUPPORTED_MODELS,
 )
-from agents.profile  import get_user_context, startup_init, invalidate_context_cache
-from agents.profile  import is_first_launch, complete_onboarding
-from agents.intent   import detect_intent
+from agents.profile import (
+    get_user_context, startup_init, invalidate_context_cache,
+    is_first_launch, complete_onboarding,
+)
 from agents.plugins.session import session_remember
-from agents.refiner  import run as run_refiner
-from agents.knowledge import run as run_knowledge
-from agents.cal_agent       import run as run_calendar
+from agents.refiner import run as run_refiner
 
 BASE_DIR = Path(__file__).resolve().parent
 CO_DIR   = BASE_DIR / ".co"
@@ -85,7 +54,7 @@ def _transcribe_audio(audio_path: str) -> str:
 
     def _clean(raw: str) -> str:
         raw = re.sub(
-            r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:ï¼]*[:ï¼]\s*",
+            r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:]*[:]\s*",
             "", raw, flags=re.IGNORECASE | re.DOTALL,
         ).strip()
         raw = re.sub(
@@ -100,13 +69,10 @@ def _transcribe_audio(audio_path: str) -> str:
             return _clean(str(transcribe(audio_path)).strip())
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            if any(code in err_str for code in ("400", "401", "403")):
+            if any(code in str(e) for code in ("400", "401", "403")):
                 raise
             if attempt < MAX_RETRIES - 1:
-                wait = BACKOFF[attempt]
-                print(f"[transcribe] attempt {attempt + 1} failed ({err_str[:80]}), retrying in {wait}s…", file=sys.stderr)
-                _time.sleep(wait)
+                _time.sleep(BACKOFF[attempt])
 
     raise RuntimeError(f"Transcription failed after {MAX_RETRIES} attempts: {last_error}")
 
@@ -122,8 +88,6 @@ def transcribe_and_enhance_impl(
     _raw_text_override : str = "",
 ) -> Dict[str, Any]:
 
-    t0 = time.perf_counter()
-
     if _raw_text_override:
         raw_text = _raw_text_override
     else:
@@ -131,31 +95,14 @@ def transcribe_and_enhance_impl(
         if not Path(audio_path).exists():
             return {"ok": False, "error": f"audio file not found: {audio_path}", "ts": now_ms()}
         raw_text = _transcribe_audio(audio_path)
-        print(f"[pipeline] transcribe {(time.perf_counter()-t0)*1000:.0f}ms  {raw_text[:60]!r}", file=sys.stderr)
 
     if not raw_text.strip():
         return {"ok": False, "error": "transcription returned empty", "ts": now_ms()}
 
     effective_app = app_name.strip() or "unknown"
+    final_text    = run_refiner(raw_text, effective_app)
 
-    # Clean fillers before intent detection so "uh uh what is AGOP" → "what is AGOP"
-    # L1 regex can then correctly match knowledge/calendar trigger words.
-    # raw_text is still passed to the agents unchanged — cleaning is only for routing.
-    from agents.refiner import _quick_clean
-    clean_for_intent = _quick_clean(raw_text)
-    intent           = detect_intent(clean_for_intent)
-    print(f"[pipeline] intent={intent} clean={clean_for_intent[:60]!r}", file=sys.stderr)
-
-    if intent == "calendar":
-        final_text = run_calendar(raw_text, raw_text)
-    elif intent == "knowledge":
-        final_text = run_knowledge(raw_text)
-    else:
-        final_text = run_refiner(raw_text, effective_app)
-
-    session_remember(raw_text, final_text)
-
-    print(f"[pipeline] total {(time.perf_counter()-t0)*1000:.0f}ms", file=sys.stderr)
+    session_remember(final_text, final_text)
 
     append_history({
         "ts":              now_ms(),
@@ -174,7 +121,9 @@ def transcribe_and_enhance_impl(
 # =========================================================
 
 def transcribe_and_enhance(audio_path, app_name="", target_language=""):
-    return transcribe_and_enhance_impl(audio_path=audio_path, app_name=app_name, target_language=target_language)
+    return transcribe_and_enhance_impl(
+        audio_path=audio_path, app_name=app_name, target_language=target_language
+    )
 
 
 def create_or_update_profile(name="", email="", organization="", role="", target_language=""):
@@ -194,7 +143,7 @@ def get_profile():
 
 def create_agent():
     agent = Agent(
-        model=get_agent_model(),   # reads from storage instead of hardcoded "gpt-5"
+        model=get_agent_model(),
         name="whispr_orchestrator",
         system_prompt="You are Whispr. You orchestrate audio transcription and refinement.",
     )
@@ -233,7 +182,6 @@ if __name__ == "__main__":
         audio_path      = sys.argv[3] if len(sys.argv) > 3 else ""
         app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
         target_language = sys.argv[5] if len(sys.argv) > 5 else ""
-        print(f"PATH: {audio_path}  EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
         result = transcribe_and_enhance_impl(audio_path, app_name, target_language)
         _exit_json({"output": result.get("final_text", "")})
 
@@ -254,8 +202,6 @@ if __name__ == "__main__":
     elif command == "get-language":
         _exit_json({"ok": True, "language": get_target_language(), "supported": SUPPORTED_LANGUAGES})
 
-    # ── Model management ──────────────────────────────────
-
     elif command == "get-model":
         _exit_json({"ok": True, "model": get_model(), "supported": SUPPORTED_MODELS})
 
@@ -263,8 +209,6 @@ if __name__ == "__main__":
         model = sys.argv[3] if len(sys.argv) > 3 else ""
         ok = set_model(model)
         _exit_json({"ok": ok, "model": get_model()}, 0 if ok else 1)
-
-    # ── API key management ────────────────────────────────
 
     elif command == "get-api-key":
         provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
@@ -281,12 +225,8 @@ if __name__ == "__main__":
         ok = remove_api_key(provider)
         _exit_json({"ok": ok}, 0 if ok else 1)
 
-    # ── Balance ───────────────────────────────────────────
-
     elif command == "get-balance":
         result: Dict[str, Any] = {"ok": True}
-
-        # Connectonion balance — read from connectonion balance API if available
         try:
             from connectonion import get_balance as _co_balance
             co = _co_balance()
@@ -296,8 +236,6 @@ if __name__ == "__main__":
             }
         except Exception:
             result["connectonion"] = {"balance_usd": None, "total_cost_usd": None}
-
-        # OpenAI balance — only attempt if key exists
         if has_api_key("openai"):
             try:
                 import urllib.request
@@ -307,15 +245,11 @@ if __name__ == "__main__":
                 )
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     data = json.loads(resp.read())
-                result["openai"] = {
-                    "balance_usd": data.get("total_available"),
-                    "plan": None,
-                }
+                result["openai"] = {"balance_usd": data.get("total_available"), "plan": None}
             except Exception:
                 result["openai"] = {"balance_usd": None, "plan": "Pay as you go"}
         else:
             result["openai"] = {"balance_usd": None, "plan": None}
-
         _exit_json(result)
 
     elif command == "set-profile":
@@ -336,8 +270,7 @@ if __name__ == "__main__":
         _exit_json({"ok": True, "profile": load_profile()})
 
     elif command == "get-history":
-        data  = load_history()
-        items = list(reversed(data.get("items", [])))
+        items = list(reversed(load_history().get("items", [])))
         _exit_json({"items": items[:100]})
 
     elif command == "save-profile":
@@ -406,10 +339,6 @@ if __name__ == "__main__":
         })
         invalidate_context_cache()
         _exit_json({"ok": True})
-
-    elif command == "calendar":
-        text = sys.argv[3] if len(sys.argv) > 3 else "today"
-        _exit_json({"output": run_calendar(text, text)})
 
     else:
         audio_path      = sys.argv[2]
