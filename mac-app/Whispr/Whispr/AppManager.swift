@@ -20,7 +20,9 @@ final class AppManager: ObservableObject {
     @Published var lastOpenAIPlan: String? = nil
     @Published var currentActiveApp: String = "Unknown"
 
-    private var targetAppPID: pid_t = 0
+    private var targetAppPID          : pid_t = 0
+    private var transcriptionCount    : Int   = 0
+    private let autoUpdateEvery        : Int   = 5
 
     // MARK: - Init
 
@@ -148,6 +150,11 @@ final class AppManager: ObservableObject {
                             self.lastOpenAIBalance       = balResult?.openAIBalance
                             self.lastOpenAIPlan          = balResult?.openAIPlan
                         }
+                    }
+                    // Auto-update dictionary every N transcriptions
+                    self.transcriptionCount += 1
+                    if self.transcriptionCount % self.autoUpdateEvery == 0 {
+                        self.localBackendClient.runDictionaryUpdate { _ in }
                     }
                 case .failure(let error):
                     self.updateAppStatus(.error)
