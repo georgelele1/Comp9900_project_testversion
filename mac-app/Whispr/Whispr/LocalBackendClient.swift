@@ -1,6 +1,5 @@
 import Foundation
 import Combine
-import EventKit
 import AppKit
 
 // MARK: - Shared response types (kept for DictionaryView / AppManager)
@@ -31,7 +30,8 @@ struct DictionaryUpdateResult {
 final class LocalBackendClient: ObservableObject {
 
     @Published var isBackendAvailable: Bool = false
-    @Published var calendarPermission: EKAuthorizationStatus = .notDetermined
+    /// Provider IDs with a stored key — free providers always included.
+    @Published var storedProviders: Set<String> = Set(Config.providers.filter { $0.free }.map { $0.id })
 
     /// Currently active model ID — kept in sync with backend storage.
     @Published var activeModel: String = Config.defaultModel
@@ -42,7 +42,7 @@ final class LocalBackendClient: ObservableObject {
 
     init() {
         checkBackendAvailability()
-        refreshCalendarPermission()
+        refreshStoredProviders()
 
         if isBackendAvailable {
             fetchModelFromBackend { [weak self] model in
@@ -74,37 +74,6 @@ final class LocalBackendClient: ObservableObject {
 
     func refreshRuntimePaths() {
         checkBackendAvailability()
-    }
-
-    // =========================================================
-    // Mac Calendar permission
-    // =========================================================
-
-    func refreshCalendarPermission() {
-        DispatchQueue.main.async {
-            self.calendarPermission = EKEventStore.authorizationStatus(for: .event)
-        }
-    }
-
-    func requestCalendarPermission(completion: @escaping (Bool) -> Void) {
-        let store = EKEventStore()
-        let handler: (Bool, Error?) -> Void = { granted, _ in
-            DispatchQueue.main.async {
-                self.calendarPermission = EKEventStore.authorizationStatus(for: .event)
-                completion(granted)
-            }
-        }
-        if #available(macOS 14.0, *) {
-            store.requestFullAccessToEvents(completion: handler)
-        } else {
-            store.requestAccess(to: .event, completion: handler)
-        }
-    }
-
-    func openCalendarSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
-            NSWorkspace.shared.open(url)
-        }
     }
 
     // =========================================================
@@ -216,8 +185,57 @@ final class LocalBackendClient: ObservableObject {
     func removeAPIKey(provider: String = "openai", completion: @escaping (Bool) -> Void) {
         guard let backendScriptPath else { completion(false); return }
         runPythonCommand(script: backendScriptPath, arguments: ["cli", "remove-api-key", provider]) { result in
-            completion((try? result.get()) != nil)
+            if (try? result.get()) != nil {
+                DispatchQueue.main.async { self.storedProviders.remove(provider) }
+                completion(true)
+            } else {
+                completion(false)
+            }
         }
+    }
+
+    // ── Provider-aware key management ─────────────────────
+
+    /// Detect provider from key prefix, save it (replacing any existing key for
+    /// that provider), and refresh storedProviders. Returns the detected provider
+    /// display name so the UI can confirm, or nil if detection failed.
+    func detectAndSaveAPIKey(
+        _ key: String,
+        completion: @escaping (Result<Config.Provider, Error>) -> Void
+    ) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            completion(.failure(makeError("Key is empty")))
+            return
+        }
+        guard let provider = Config.detectProvider(for: trimmed) else {
+            completion(.failure(makeError("Could not detect provider from key prefix")))
+            return
+        }
+        saveAPIKey(trimmed, provider: provider.id) { success in
+            if success {
+                DispatchQueue.main.async { self.storedProviders.insert(provider.id) }
+                completion(.success(provider))
+            } else {
+                completion(.failure(self.makeError("Failed to save key for \(provider.displayName)")))
+            }
+        }
+    }
+
+    /// Refresh storedProviders by checking which providers have a key stored.
+    func refreshStoredProviders() {
+        let paid = Config.providers.filter { !$0.free }
+        let group = DispatchGroup()
+        var found = Set(Config.providers.filter { $0.free }.map { $0.id })
+
+        for provider in paid {
+            group.enter()
+            checkAPIKeyExists(provider: provider.id) { exists in
+                if exists { found.insert(provider.id) }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { self.storedProviders = found }
     }
 
     // =========================================================
