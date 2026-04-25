@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 import Combine
-import EventKit
 
 final class MainWindowController: NSObject, ObservableObject {
     static let shared = MainWindowController()
@@ -34,26 +33,27 @@ final class MainWindowController: NSObject, ObservableObject {
 
         let sidebarItem = NSSplitViewItem(sidebarWithViewController:
             NSHostingController(rootView: SidebarView(controller: self)))
-        sidebarItem.minimumThickness = 220
-        sidebarItem.maximumThickness = 220
+        sidebarItem.minimumThickness = 238
+        sidebarItem.maximumThickness = 238
         sidebarItem.canCollapse = false
         splitVC.addSplitViewItem(sidebarItem)
 
         let contentItem = NSSplitViewItem(viewController:
             NSHostingController(rootView: NavigationContentView(controller: self)))
-        contentItem.minimumThickness = 480
+        contentItem.minimumThickness = 520
         splitVC.addSplitViewItem(contentItem)
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 980, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 1040, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+
         win.title = "Whispr"
         win.contentViewController = splitVC
         win.isReleasedWhenClosed = false
-        win.minSize = NSSize(width: 820, height: 580)
+        win.minSize = NSSize(width: 860, height: 600)
         win.center()
         window = win
     }
@@ -79,6 +79,17 @@ enum NavItem: String, CaseIterable {
         case .apiKeys:    return "key"
         }
     }
+
+    var group: String {
+        switch self {
+        case .home, .history:
+            return "Workspace"
+        case .dictionary, .snippets:
+            return "Personalisation"
+        case .shortcuts, .apiKeys:
+            return "Settings"
+        }
+    }
 }
 
 // MARK: - NavigationContentView
@@ -88,15 +99,26 @@ struct NavigationContentView: View {
     @State private var currentNav: NavItem = .home
 
     var body: some View {
-        Group {
-            switch currentNav {
-            case .home:       HomeView()
-            case .history:    HistoryView(backendClient: AppManager.shared.localBackendClient)
-            case .dictionary: DictionaryView(backendClient: AppManager.shared.localBackendClient)
-            case .snippets:   SnippetsView(backendClient: AppManager.shared.localBackendClient)
-            case .shortcuts:  ShortcutsView()
-            case .apiKeys:    APIKeysView(backendClient: AppManager.shared.localBackendClient)
+        ZStack {
+            WhisprTheme.appBackground
+
+            Group {
+                switch currentNav {
+                case .home:
+                    HomeView()
+                case .history:
+                    HistoryView(backendClient: AppManager.shared.localBackendClient)
+                case .dictionary:
+                    DictionaryView(backendClient: AppManager.shared.localBackendClient)
+                case .snippets:
+                    SnippetsView(backendClient: AppManager.shared.localBackendClient)
+                case .shortcuts:
+                    ShortcutsView()
+                case .apiKeys:
+                    APIKeysView(backendClient: AppManager.shared.localBackendClient)
+                }
             }
+            .padding(18)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onReceive(controller.$selectedNav) { currentNav = $0 }
@@ -114,8 +136,6 @@ struct SidebarView: View {
     @State private var syncStatus       : String  = ""
     @State private var activeModel      : String  = AppManager.shared.localBackendClient.activeModel
 
-    @State private var calendarStatus: EKAuthorizationStatus = EKEventStore.authorizationStatus(for: .event)
-
     @State private var clearingHistory    : ClearState = .idle
     @State private var clearingDictionary : ClearState = .idle
     @State private var clearingSnippets   : ClearState = .idle
@@ -126,233 +146,49 @@ struct SidebarView: View {
 
     private var backendClient: LocalBackendClient { AppManager.shared.localBackendClient }
 
-    private var calendarGranted: Bool {
-        calendarStatus == .authorized || calendarStatus == .fullAccess
+    private var groupedNav: [(String, [NavItem])] {
+        [
+            ("Workspace", NavItem.allCases.filter { $0.group == "Workspace" }),
+            ("Personalisation", NavItem.allCases.filter { $0.group == "Personalisation" }),
+            ("Settings", NavItem.allCases.filter { $0.group == "Settings" })
+        ]
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    WhisprTheme.accent.opacity(0.20),
+                    Color(NSColor.controlBackgroundColor)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
 
-            // ── Brand ─────────────────────────────────────────
-            HStack(spacing: 10) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 7)
-                        .fill(Color(red: 0.498, green: 0.467, blue: 0.867))
-                        .frame(width: 28, height: 28)
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.white)
+            VStack(alignment: .leading, spacing: 0) {
+
+                brandHeader
+
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        navMenu
+                        modelCard
+                        languageCard
+                        dataManagementCard
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
                 }
-                Text("Whispr").font(.system(size: 15, weight: .medium))
+
+                Spacer(minLength: 0)
+                Divider()
+
+                quitButton
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-
-            Divider()
-
-            // ── Nav ───────────────────────────────────────────
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Menu")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 12)
-                    .padding(.bottom, 4)
-
-                ForEach(NavItem.allCases, id: \.self) { item in
-                    NavRow(item: item, isSelected: selectedNav == item) {
-                        selectedNav = item
-                        controller.navigate(to: item)
-                    }
-                }
-            }
-
-            Divider().padding(.top, 8)
-
-            // ── Active model indicator ─────────────────────────
-            Button {
-                selectedNav = .apiKeys
-                controller.navigate(to: .apiKeys)
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "cpu")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color(red: 0.498, green: 0.467, blue: 0.867))
-                    Text(activeModel)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 7)
-                .background(Color(NSColor.textBackgroundColor))
-                .cornerRadius(6)
-                .overlay(RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color(red: 0.498, green: 0.467, blue: 0.867).opacity(0.3), lineWidth: 0.5))
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-
-            Divider()
-
-            // ── Settings ──────────────────────────────────────
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
-
-                    SettingsSection(title: "Hotkeys") {
-                        Button {
-                            selectedNav = .shortcuts
-                            controller.navigate(to: .shortcuts)
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack(spacing: 4) {
-                                        Text("Start").font(.system(size: 12)).foregroundColor(.primary)
-                                        Spacer()
-                                        Text(ShortcutManager.shared.startShortcut.displayString)
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                    }
-                                    HStack(spacing: 4) {
-                                        Text("Stop").font(.system(size: 12)).foregroundColor(.primary)
-                                        Spacer()
-                                        Text(ShortcutManager.shared.stopShortcut.displayString)
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                    }
-                                }
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.secondary)
-                                    .padding(.leading, 4)
-                            }
-                            .padding(.horizontal, 10).padding(.vertical, 8)
-                            .background(Color(NSColor.textBackgroundColor))
-                            .cornerRadius(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    Divider().padding(.vertical, 10)
-
-                    SettingsSection(title: "Output language") {
-                        Picker("", selection: $selectedLanguage) {
-                            ForEach(Config.supportedLanguages, id: \.self) { Text($0).tag($0) }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
-                        .onChange(of: selectedLanguage) { newValue in
-                            LanguageManager.shared.setLanguage(newValue)
-                            MenuBarController.shared.refreshLanguageMenu()
-                            syncStatus = "Saving…"
-                            backendClient.syncLanguageToBackend { success in
-                                DispatchQueue.main.async {
-                                    syncStatus = success ? "Saved" : "Saved locally"
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { syncStatus = "" }
-                                }
-                            }
-                        }
-                        if !syncStatus.isEmpty {
-                            Text(syncStatus).font(.caption2).foregroundColor(.secondary)
-                        }
-                    }
-
-                    Divider().padding(.vertical, 10)
-
-                    // ── Mac Calendar permission ────────────────
-                    SettingsSection(title: "Calendar") {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(calendarGranted ? Color.green : Color.orange)
-                                .frame(width: 7, height: 7)
-                            Text(calendarGranted ? "Access granted" : calendarStatusLabel)
-                                .font(.system(size: 12))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                        }
-
-                        if !calendarGranted {
-                            Button(calendarButtonLabel) { handleCalendarButton() }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                                .tint(Color(red: 0.498, green: 0.467, blue: 0.867))
-                        }
-
-                        Text("Whispr reads Mac Calendar — no Google sign-in needed.")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    Divider().padding(.vertical, 10)
-
-                    SettingsSection(title: "Data Management") {
-                        VStack(spacing: 5) {
-                            ClearRow(label: "Transcription history",     state: clearingHistory)    { armClear(.history) }
-                            ClearRow(label: "Personal dictionary",       state: clearingDictionary) { armClear(.dictionary) }
-                            ClearRow(label: "Voice snippets",            state: clearingSnippets)   { armClear(.snippets) }
-                            ClearRow(label: "Profile & learned context", state: resettingProfile)   { armClear(.profile) }
-
-                            Button { armClear(.all) } label: {
-                                HStack(spacing: 5) {
-                                    Image(systemName: "trash").font(.system(size: 10))
-                                    Text("Reset All Data").font(.system(size: 11, weight: .medium))
-                                }
-                                .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .foregroundColor(.red)
-                            .padding(.top, 3)
-                        }
-                    }
-                    .alert(
-                        pendingClear?.alertTitle ?? "Confirm",
-                        isPresented: $showClearAlert,
-                        presenting: pendingClear
-                    ) { action in
-                        Button("Cancel", role: .cancel) { pendingClear = nil }
-                        Button(action.confirmLabel, role: .destructive) {
-                            executeClear(action)
-                            pendingClear = nil
-                        }
-                    } message: { action in
-                        Text(action.alertMessage)
-                    }
-                }
-                .padding(.top, 10)
-            }
-
-            Spacer()
-            Divider()
-
-            // ── Quit ─────────────────────────────────────────
-            Button {
-                NSApp.terminate(nil)
-            } label: {
-                HStack(spacing: 9) {
-                    Image(systemName: "power").font(.system(size: 12)).frame(width: 16)
-                    Text("Quit Whispr").font(.system(size: 12))
-                    Spacer()
-                }
-                .foregroundColor(.red)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 6)
-            }
-            .buttonStyle(.plain)
-            .padding(.vertical, 8)
         }
-        .frame(width: 220)
-        .background(Color(NSColor.controlBackgroundColor))
+        .frame(width: 238)
         .onAppear {
-            refreshCalendarStatus()
             backendClient.fetchLanguageFromBackend { lang in
                 DispatchQueue.main.async {
                     LanguageManager.shared.syncFromBackend(lang)
@@ -364,45 +200,240 @@ struct SidebarView: View {
         .onReceive(controller.$selectedNav) { selectedNav = $0 }
         .onReceive(LanguageManager.shared.$current) { selectedLanguage = $0 }
         .onReceive(AppManager.shared.localBackendClient.$activeModel) { activeModel = $0 }
-        .onReceive(AppManager.shared.localBackendClient.$calendarPermission) { status in
-            calendarStatus = status
+    }
+
+    private var brandHeader: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [WhisprTheme.accent, WhisprTheme.accent2],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 44, height: 44)
+
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Whispr")
+                    .font(.system(size: 18, weight: .bold))
+
+                Text("AI voice assistant")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
         }
+        .padding(14)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.8)
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
     }
 
-    // MARK: - Calendar permission helpers
+    private var navMenu: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(groupedNav, id: \.0) { group, items in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(group)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .textCase(.uppercase)
+                        .tracking(0.7)
+                        .padding(.horizontal, 8)
 
-    private var calendarStatusLabel: String {
-        switch calendarStatus {
-        case .authorized, .fullAccess:  return "Access granted"
-        case .denied:                   return "Access denied"
-        case .restricted:               return "Restricted by system"
-        case .notDetermined:            return "Not yet granted"
-        case .writeOnly:                return "Write-only access"
-        @unknown default:               return "Unknown"
-        }
-    }
-
-    private var calendarButtonLabel: String {
-        switch calendarStatus {
-        case .denied, .restricted:  return "Open Settings…"
-        default:                    return "Grant Access"
-        }
-    }
-
-    private func refreshCalendarStatus() {
-        calendarStatus = EKEventStore.authorizationStatus(for: .event)
-    }
-
-    private func handleCalendarButton() {
-        switch calendarStatus {
-        case .denied, .restricted:
-            backendClient.openCalendarSettings()
-        default:
-            backendClient.requestCalendarPermission { _ in
-                calendarStatus = EKEventStore.authorizationStatus(for: .event)
-                MenuBarController.shared.refreshCalendarItem()
+                    VStack(spacing: 3) {
+                        ForEach(items, id: \.self) { item in
+                            NavRow(item: item, isSelected: selectedNav == item) {
+                                selectedNav = item
+                                controller.navigate(to: item)
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    private var modelCard: some View {
+        Button {
+            selectedNav = .apiKeys
+            controller.navigate(to: .apiKeys)
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("Active Model", systemImage: "cpu")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+
+                Text(activeModel)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(WhisprTheme.accent.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .padding(12)
+            .background(.regularMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(WhisprTheme.border, lineWidth: 0.8)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var languageCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label("Output Language", systemImage: "globe")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+
+            Picker("", selection: $selectedLanguage) {
+                ForEach(Config.supportedLanguages, id: \.self) {
+                    Text($0).tag($0)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .onChange(of: selectedLanguage) { newValue in
+                LanguageManager.shared.setLanguage(newValue)
+                MenuBarController.shared.refreshLanguageMenu()
+                syncStatus = "Saving…"
+
+                backendClient.syncLanguageToBackend { success in
+                    DispatchQueue.main.async {
+                        syncStatus = success ? "Saved" : "Saved locally"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            syncStatus = ""
+                        }
+                    }
+                }
+            }
+
+            if !syncStatus.isEmpty {
+                Text(syncStatus)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(WhisprTheme.border, lineWidth: 0.8)
+        )
+    }
+
+    private var dataManagementCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label("Data Management", systemImage: "externaldrive")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+
+            VStack(spacing: 5) {
+                ClearRow(label: "Transcription history", state: clearingHistory) {
+                    armClear(.history)
+                }
+
+                ClearRow(label: "Personal dictionary", state: clearingDictionary) {
+                    armClear(.dictionary)
+                }
+
+                ClearRow(label: "Voice snippets", state: clearingSnippets) {
+                    armClear(.snippets)
+                }
+
+                ClearRow(label: "Profile context", state: resettingProfile) {
+                    armClear(.profile)
+                }
+
+                Button {
+                    armClear(.all)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "trash")
+                        Text("Reset All Data")
+                        Spacer()
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.red)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .background(Color.red.opacity(0.07))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 2)
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(WhisprTheme.border, lineWidth: 0.8)
+        )
+        .alert(
+            pendingClear?.alertTitle ?? "Confirm",
+            isPresented: $showClearAlert,
+            presenting: pendingClear
+        ) { action in
+            Button("Cancel", role: .cancel) {
+                pendingClear = nil
+            }
+
+            Button(action.confirmLabel, role: .destructive) {
+                executeClear(action)
+                pendingClear = nil
+            }
+        } message: { action in
+            Text(action.alertMessage)
+        }
+    }
+
+    private var quitButton: some View {
+        Button {
+            NSApp.terminate(nil)
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: "power")
+                    .font(.system(size: 12))
+                    .frame(width: 16)
+
+                Text("Quit Whispr")
+                    .font(.system(size: 12))
+
+                Spacer()
+            }
+            .foregroundColor(.red)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Data management
@@ -417,106 +448,153 @@ struct SidebarView: View {
         case .history:
             clearingHistory = .running
             backendClient.clearHistory { ok in
-                self.clearingHistory = ok ? .done : .failed
-                self.scheduleReset { self.clearingHistory = .idle }
+                clearingHistory = ok ? .done : .failed
+                scheduleReset { clearingHistory = .idle }
             }
+
         case .dictionary:
             clearingDictionary = .running
             backendClient.clearDictionary { ok in
-                self.clearingDictionary = ok ? .done : .failed
-                self.scheduleReset { self.clearingDictionary = .idle }
+                clearingDictionary = ok ? .done : .failed
+                scheduleReset { clearingDictionary = .idle }
             }
+
         case .snippets:
             clearingSnippets = .running
             backendClient.clearSnippets { ok in
-                self.clearingSnippets = ok ? .done : .failed
-                self.scheduleReset { self.clearingSnippets = .idle }
+                clearingSnippets = ok ? .done : .failed
+                scheduleReset { clearingSnippets = .idle }
             }
+
         case .profile:
             resettingProfile = .running
             backendClient.resetProfile { ok in
-                self.resettingProfile = ok ? .done : .failed
-                self.scheduleReset { self.resettingProfile = .idle }
+                resettingProfile = ok ? .done : .failed
+                scheduleReset { resettingProfile = .idle }
             }
+
         case .all:
-            clearingHistory = .running; clearingDictionary = .running
-            clearingSnippets = .running; resettingProfile = .running
+            clearingHistory = .running
+            clearingDictionary = .running
+            clearingSnippets = .running
+            resettingProfile = .running
+
             backendClient.resetAll { ok in
-                let s: ClearState = ok ? .done : .failed
-                self.clearingHistory = s; self.clearingDictionary = s
-                self.clearingSnippets = s; self.resettingProfile = s
-                self.scheduleReset { self.clearingHistory = .idle }
-                self.scheduleReset { self.clearingDictionary = .idle }
-                self.scheduleReset { self.clearingSnippets = .idle }
-                self.scheduleReset { self.resettingProfile = .idle }
-            }
-        }
-    }
+                let state: ClearState = ok ? .done : .failed
+                clearingHistory = state
+                clearingDictionary = state
+                clearingSnippets = state
+                resettingProfile = state
 
-    private func scheduleReset(_ reset: @escaping () -> Void) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: reset)
-    }
-}
-
-// MARK: - ClearRow
-
-private struct ClearRow: View {
-    let label  : String
-    let state  : ClearState
-    let action : () -> Void
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Group {
-                switch state {
-                case .idle:
-                    Text(label).font(.system(size: 12)).foregroundColor(.primary)
-                case .running:
-                    HStack(spacing: 4) {
-                        ProgressView().scaleEffect(0.55)
-                        Text(label).font(.system(size: 12)).foregroundColor(.secondary)
-                    }
-                case .done:
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill").font(.system(size: 10)).foregroundColor(.green)
-                        Text(label).font(.system(size: 12)).foregroundColor(.secondary)
-                    }
-                case .failed:
-                    HStack(spacing: 4) {
-                        Image(systemName: "xmark.circle.fill").font(.system(size: 10)).foregroundColor(.red)
-                        Text(label).font(.system(size: 12)).foregroundColor(.red)
-                    }
+                scheduleReset {
+                    clearingHistory = .idle
+                    clearingDictionary = .idle
+                    clearingSnippets = .idle
+                    resettingProfile = .idle
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button("Clear") { action() }
-                .buttonStyle(.plain)
-                .font(.system(size: 11))
-                .foregroundColor(.red)
-                .disabled(state == .running)
-                .opacity(state == .running ? 0 : 1)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(Color(NSColor.textBackgroundColor))
-        .cornerRadius(6)
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
+    }
+
+    private func scheduleReset(_ block: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            block()
+        }
     }
 }
 
-// MARK: - Supporting enums
+// MARK: - Nav Row
 
-enum ClearState: Equatable { case idle, running, done, failed }
+struct NavRow: View {
+    let item: NavItem
+    let isSelected: Bool
+    let action: () -> Void
 
-private enum DataClearAction {
-    case history, dictionary, snippets, profile, all
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isSelected ? WhisprTheme.accent.opacity(0.18) : Color.clear)
+                        .frame(width: 28, height: 28)
+
+                    Image(systemName: item.icon)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(isSelected ? WhisprTheme.accent : .secondary)
+                }
+
+                Text(item.rawValue)
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                    .foregroundColor(isSelected ? .primary : .secondary)
+
+                Spacer()
+
+                if isSelected {
+                    Circle()
+                        .fill(WhisprTheme.accent)
+                        .frame(width: 6, height: 6)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(
+                Group {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(.regularMaterial)
+                    } else {
+                        Color.clear
+                    }
+                }
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .stroke(isSelected ? WhisprTheme.border : Color.clear, lineWidth: 0.8)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Clear UI
+
+enum ClearState {
+    case idle
+    case running
+    case done
+    case failed
+
+    var icon: String {
+        switch self {
+        case .idle:    return "trash"
+        case .running: return "hourglass"
+        case .done:    return "checkmark"
+        case .failed:  return "xmark"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .idle:    return .secondary
+        case .running: return WhisprTheme.accent
+        case .done:    return .green
+        case .failed:  return .red
+        }
+    }
+}
+
+enum DataClearAction {
+    case history
+    case dictionary
+    case snippets
+    case profile
+    case all
 
     var alertTitle: String {
         switch self {
-        case .history:    return "Clear Transcription History?"
-        case .dictionary: return "Clear Personal Dictionary?"
-        case .snippets:   return "Clear Voice Snippets?"
+        case .history:    return "Clear History?"
+        case .dictionary: return "Clear Dictionary?"
+        case .snippets:   return "Clear Snippets?"
         case .profile:    return "Reset Profile?"
         case .all:        return "Reset All Data?"
         }
@@ -524,55 +602,53 @@ private enum DataClearAction {
 
     var alertMessage: String {
         switch self {
-        case .history:    return "All past transcriptions will be permanently deleted."
-        case .dictionary: return "Every custom term and alias will be removed. This cannot be undone."
-        case .snippets:   return "All voice snippet shortcuts will be deleted. This cannot be undone."
-        case .profile:    return "Your name, organisation, role and AI-learned context will be cleared. Your language preference is kept."
-        case .all:        return "History, dictionary, snippets and profile will all be permanently deleted. Your language preference is kept."
+        case .history:
+            return "This will delete all transcription history."
+        case .dictionary:
+            return "This will delete your personal dictionary terms."
+        case .snippets:
+            return "This will delete all saved voice snippets."
+        case .profile:
+            return "This will reset your profile and learned context."
+        case .all:
+            return "This will delete history, dictionary, snippets, and profile context."
         }
     }
 
     var confirmLabel: String {
         switch self {
-        case .history:    return "Clear History"
-        case .dictionary: return "Clear Dictionary"
-        case .snippets:   return "Clear Snippets"
-        case .profile:    return "Reset Profile"
-        case .all:        return "Reset Everything"
+        case .all:
+            return "Reset All"
+        default:
+            return "Clear"
         }
     }
 }
 
-// MARK: - Sidebar sub-components
+struct ClearRow: View {
+    let label: String
+    let state: ClearState
+    let action: () -> Void
 
-struct NavRow: View {
-    let item: NavItem; let isSelected: Bool; let action: () -> Void
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 9) {
-                Image(systemName: item.icon).font(.system(size: 13)).frame(width: 16)
-                Text(item.rawValue).font(.system(size: 13, weight: isSelected ? .medium : .regular))
+            HStack(spacing: 7) {
+                Image(systemName: state.icon)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(state.color)
+                    .frame(width: 14)
+
+                Text(label)
+                    .font(.system(size: 11))
+                    .foregroundColor(.primary)
+
                 Spacer()
             }
-            .foregroundColor(isSelected ? .primary : .secondary)
-            .padding(.horizontal, 10).padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 6)
-                .fill(isSelected ? Color(NSColor.selectedContentBackgroundColor).opacity(0.15) : Color.clear))
-            .overlay(Rectangle().fill(Color(red: 0.498, green: 0.467, blue: 0.867))
-                .frame(width: 2).opacity(isSelected ? 1 : 0), alignment: .leading)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .background(Color(NSColor.textBackgroundColor).opacity(0.65))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 8)
-    }
-}
-
-struct SettingsSection<Content: View>: View {
-    let title: String; @ViewBuilder let content: () -> Content
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.system(size: 10, weight: .medium)).foregroundColor(.secondary)
-                .textCase(.uppercase).tracking(0.5).padding(.horizontal, 14)
-            VStack(alignment: .leading, spacing: 4) { content() }.padding(.horizontal, 12)
-        }
     }
 }
