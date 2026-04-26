@@ -2,108 +2,111 @@
 app.py — Whispr main pipeline orchestrator.
 
 Responsibilities:
-  - Transcribe audio → raw text
-  - Dispatch to refiner
-  - Append to history
-  - Expose CLI commands
-
-All context injection, language, eval, snippet expansion, and background
-updates are handled inside the refiner via on_events — not here.
-
-File layout:
-  app.py
-  dictionary_agent.py
-  snippets.py
-  storage.py
-  agents/
-    profile.py
-    refiner.py
-  plugins/
-    __init__.py
-    lang.py
-    visibility.py
-    eval.py
-    snippets.py
-    session.py
+- Transcribe audio to raw text
+- Send raw text + active app name to refiner agent
+- Save history and session memory
+- Expose CLI commands for frontend
 """
+
 from __future__ import annotations
 
-import io as _io
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict
 
-import sys as _sys
-from pathlib import Path as _Path
-_backend_root = str(_Path(__file__).resolve().parent)
-if _backend_root not in _sys.path:
-    _sys.path.insert(0, _backend_root)
+BACKEND_ROOT = Path(__file__).resolve().parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
-_real_stdout, _real_stderr = sys.stdout, sys.stderr
-sys.stdout = sys.stderr = _io.StringIO()
 from connectonion.address import load
 from connectonion import Agent, host, transcribe
-sys.stdout = _real_stdout
-sys.stderr = _real_stderr
 
-from storage import _env_path
 from storage import (
-    app_support_dir, now_ms, load_store, save_store,
-    load_profile, save_profile, load_history, append_history,
-    get_target_language, set_target_language,
-    get_model, set_model, get_agent_model,
-    get_api_key, set_api_key, remove_api_key, has_api_key,
-    SUPPORTED_LANGUAGES, SUPPORTED_MODELS, MODEL_OPTIONS,
+    app_support_dir,
+    now_ms,
+    save_store,
+    load_env_into_os,
+    load_profile,
+    save_profile,
+    load_history,
+    append_history,
+    get_target_language,
+    set_target_language,
+    get_model,
+    set_model,
+    get_agent_model,
+    set_api_key,
+    remove_api_key,
+    has_api_key,
+    SUPPORTED_LANGUAGES,
+    SUPPORTED_MODELS,
 )
-from agents.profile  import get_user_context, startup_init, invalidate_context_cache
-from agents.profile  import is_first_launch, complete_onboarding
-from agents.plugins.session import session_remember
-from agents.refiner  import run as run_refiner
+
+from agents.profile import (
+    startup_init,
+    invalidate_context_cache,
+    is_first_launch,
+    complete_onboarding,
+)
+
+from agents.plugins.session import session_remember, clear_session
+from agents.refiner import run as run_refiner
+
 
 BASE_DIR = Path(__file__).resolve().parent
-CO_DIR   = BASE_DIR / ".co"
+CO_DIR = BASE_DIR / ".co"
+
+load_env_into_os()
+startup_init()
 
 
 # =========================================================
 # Audio transcription
 # =========================================================
 
+def _clean_transcription(raw: str) -> str:
+    raw = str(raw or "").strip()
+
+    raw = re.sub(
+        r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:：]*[:：]\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    raw = re.sub(
+        r"^(好的[，,\s]*)?(以下是(?:音檔|音频|音訊)?的?逐字稿如下|以下是轉錄結果)[：:\s]*",
+        "",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    return raw.strip("「」\"' \n\t")
+
+
 def _transcribe_audio(audio_path: str) -> str:
-    import re
-    import time as _time
-
-    MAX_RETRIES = 3
-    BACKOFF     = [2, 5, 10]
-
-    def _clean(raw: str) -> str:
-        raw = re.sub(
-            r"^(sure,?\s+)?(here\s+is\s+the\s+transcription|transcription)[^:ï¼]*[:ï¼]\s*",
-            "", raw, flags=re.IGNORECASE | re.DOTALL,
-        ).strip()
-        raw = re.sub(
-            r"^(好的[，,\s]*)?(以下是(?:音檔|音频|音訊)?的?逐字稿如下|以下是轉錄結果)[：:\s]*",
-            "", raw, flags=re.IGNORECASE | re.DOTALL,
-        ).strip()
-        return raw.strip("「」\"' \n\t")
-
+    max_retries = 3
+    backoff = [2, 5, 10]
     last_error = None
-    for attempt in range(MAX_RETRIES):
+
+    for attempt in range(max_retries):
         try:
-            return _clean(str(transcribe(audio_path)).strip())
+            return _clean_transcription(transcribe(audio_path))
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            if any(code in err_str for code in ("400", "401", "403")):
-                raise
-            if attempt < MAX_RETRIES - 1:
-                wait = BACKOFF[attempt]
-                print(f"[transcribe] attempt {attempt + 1} failed ({err_str[:80]}), retrying in {wait}s…", file=sys.stderr)
-                _time.sleep(wait)
+            err = str(e)
 
-    raise RuntimeError(f"Transcription failed after {MAX_RETRIES} attempts: {last_error}")
+            if any(code in err for code in ("400", "401", "403")):
+                raise
+
+            if attempt < max_retries - 1:
+                time.sleep(backoff[attempt])
+
+    raise RuntimeError(f"Transcription failed after {max_retries} attempts: {last_error}")
 
 
 # =========================================================
@@ -111,44 +114,56 @@ def _transcribe_audio(audio_path: str) -> str:
 # =========================================================
 
 def transcribe_and_enhance_impl(
-    audio_path         : str,
-    app_name           : str = "",
-    target_language    : str = "",
-    _raw_text_override : str = "",
+    audio_path: str,
+    app_name: str = "",
+    target_language: str = "",
+    _raw_text_override: str = "",
 ) -> Dict[str, Any]:
 
-    t0 = time.perf_counter()
-
     if _raw_text_override:
-        raw_text = _raw_text_override
+        raw_text = str(_raw_text_override).strip()
+        audio_path = ""
     else:
         audio_path = str(Path(audio_path).expanduser())
+
         if not Path(audio_path).exists():
-            return {"ok": False, "error": f"audio file not found: {audio_path}", "ts": now_ms()}
+            return {
+                "ok": False,
+                "error": f"audio file not found: {audio_path}",
+                "ts": now_ms(),
+            }
+
         raw_text = _transcribe_audio(audio_path)
-        print(f"[pipeline] transcribe {(time.perf_counter()-t0)*1000:.0f}ms  {raw_text[:60]!r}", file=sys.stderr)
 
     if not raw_text.strip():
-        return {"ok": False, "error": "transcription returned empty", "ts": now_ms()}
+        return {
+            "ok": False,
+            "error": "transcription returned empty",
+            "ts": now_ms(),
+        }
 
-    effective_app = app_name.strip() or "unknown"
+    effective_app = str(app_name or "unknown").strip() or "unknown"
 
     final_text = run_refiner(raw_text, effective_app)
 
     session_remember(raw_text, final_text)
 
-    print(f"[pipeline] total {(time.perf_counter()-t0)*1000:.0f}ms", file=sys.stderr)
-
     append_history({
-        "ts":              now_ms(),
-        "audio_path":      audio_path if not _raw_text_override else "",
-        "raw_text":        raw_text,
-        "final_text":      final_text,
-        "app_name":        effective_app,
+        "ts": now_ms(),
+        "audio_path": audio_path,
+        "raw_text": raw_text,
+        "final_text": final_text,
+        "app_name": effective_app,
         "target_language": target_language or get_target_language(),
     })
 
-    return {"ok": True, "raw_text": raw_text, "final_text": final_text, "ts": now_ms()}
+    return {
+        "ok": True,
+        "raw_text": raw_text,
+        "final_text": final_text,
+        "app_name": effective_app,
+        "ts": now_ms(),
+    }
 
 
 # =========================================================
@@ -156,17 +171,39 @@ def transcribe_and_enhance_impl(
 # =========================================================
 
 def transcribe_and_enhance(audio_path, app_name="", target_language=""):
-    return transcribe_and_enhance_impl(audio_path=audio_path, app_name=app_name, target_language=target_language)
+    return transcribe_and_enhance_impl(
+        audio_path=audio_path,
+        app_name=app_name,
+        target_language=target_language,
+    )
 
 
-def create_or_update_profile(name="", email="", organization="", role="", target_language=""):
+def create_or_update_profile(
+    name="",
+    email="",
+    organization="",
+    role="",
+    target_language="",
+):
     profile = load_profile()
-    for key, val in {"name": name, "email": email, "organization": organization, "role": role}.items():
-        if str(val).strip():
-            profile[key] = str(val).strip()
-    if target_language.strip() in SUPPORTED_LANGUAGES:
-        profile.setdefault("preferences", {})["target_language"] = target_language.strip()
+
+    for key, value in {
+        "name": name,
+        "email": email,
+        "organization": organization,
+        "role": role,
+    }.items():
+        value = str(value or "").strip()
+        if value:
+            profile[key] = value
+
+    target_language = str(target_language or "").strip()
+    if target_language in SUPPORTED_LANGUAGES:
+        profile.setdefault("preferences", {})["target_language"] = target_language
+
     save_profile(profile)
+    invalidate_context_cache()
+
     return {"ok": True, "profile": profile}
 
 
@@ -176,29 +213,39 @@ def get_profile():
 
 def create_agent():
     agent = Agent(
-        model=get_agent_model(),   # reads from storage instead of hardcoded "gpt-5"
+        model=get_agent_model(),
         name="whispr_orchestrator",
-        system_prompt="You are Whispr. You orchestrate audio transcription and refinement.",
+        system_prompt=(
+            "You are Whispr. You orchestrate audio transcription, "
+            "text refinement, and profile management."
+        ),
     )
+
     for fn in (create_or_update_profile, get_profile, transcribe_and_enhance):
-        for attr in ("add_tools", "add_tool"):
+        for attr in ("add_tool", "add_tools"):
             if hasattr(agent, attr):
                 getattr(agent, attr)(fn)
                 break
+
     return agent
 
 
-startup_init()
-
-
 # =========================================================
-# CLI
+# CLI helpers
 # =========================================================
 
 def _exit_json(data, code=0):
     print(json.dumps(data, ensure_ascii=False))
     sys.exit(code)
 
+
+def _arg(index: int, default: str = "") -> str:
+    return sys.argv[index] if len(sys.argv) > index else default
+
+
+# =========================================================
+# CLI
+# =========================================================
 
 if __name__ == "__main__":
     if not (len(sys.argv) > 1 and sys.argv[1] == "cli"):
@@ -207,117 +254,120 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if len(sys.argv) < 3:
-        _exit_json({"output": ""}, 1)
+        _exit_json({"ok": False, "error": "missing command"}, 1)
 
     command = sys.argv[2]
 
     if command == "transcribe":
-        audio_path      = sys.argv[3] if len(sys.argv) > 3 else ""
-        app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
-        target_language = sys.argv[5] if len(sys.argv) > 5 else ""
-        print(f"PATH: {audio_path}  EXISTS: {os.path.exists(audio_path)}", file=sys.stderr)
+        audio_path = _arg(3)
+        app_name = _arg(4, "unknown")
+        target_language = _arg(5)
+
         result = transcribe_and_enhance_impl(audio_path, app_name, target_language)
-        _exit_json({"output": result.get("final_text", "")})
+        _exit_json({
+            "ok": result.get("ok", False),
+            "output": result.get("final_text", ""),
+            "error": result.get("error", ""),
+        }, 0 if result.get("ok") else 1)
 
     elif command == "refine":
-        raw_text        = sys.argv[3] if len(sys.argv) > 3 else ""
-        app_name        = sys.argv[4] if len(sys.argv) > 4 else "unknown"
-        target_language = sys.argv[5] if len(sys.argv) > 5 else ""
+        raw_text = _arg(3)
+        app_name = _arg(4, "unknown")
+        target_language = _arg(5)
+
         if not raw_text:
-            _exit_json({"error": "no text provided"}, 1)
-        result = transcribe_and_enhance_impl("", app_name, target_language, _raw_text_override=raw_text)
-        _exit_json({"input": raw_text, "output": result.get("final_text", "")})
+            _exit_json({"ok": False, "error": "no text provided"}, 1)
+
+        result = transcribe_and_enhance_impl(
+            "",
+            app_name,
+            target_language,
+            _raw_text_override=raw_text,
+        )
+
+        _exit_json({
+            "ok": result.get("ok", False),
+            "input": raw_text,
+            "output": result.get("final_text", ""),
+            "error": result.get("error", ""),
+        }, 0 if result.get("ok") else 1)
 
     elif command == "set-language":
-        language = sys.argv[3] if len(sys.argv) > 3 else ""
+        language = _arg(3)
         ok = set_target_language(language)
-        _exit_json({"ok": ok, "language": language, "supported": SUPPORTED_LANGUAGES}, 0 if ok else 1)
+        _exit_json({
+            "ok": ok,
+            "language": get_target_language(),
+            "supported": SUPPORTED_LANGUAGES,
+        }, 0 if ok else 1)
 
     elif command == "get-language":
-        _exit_json({"ok": True, "language": get_target_language(), "supported": SUPPORTED_LANGUAGES})
-
-    # ── Model management ──────────────────────────────────
+        _exit_json({
+            "ok": True,
+            "language": get_target_language(),
+            "supported": SUPPORTED_LANGUAGES,
+        })
 
     elif command == "get-model":
-        _exit_json({"ok": True, "model": get_model(), "supported": SUPPORTED_MODELS})
+        _exit_json({
+            "ok": True,
+            "model": get_model(),
+            "supported": SUPPORTED_MODELS,
+        })
 
     elif command == "set-model":
-        model = sys.argv[3] if len(sys.argv) > 3 else ""
+        model = _arg(3)
         ok = set_model(model)
-        _exit_json({"ok": ok, "model": get_model()}, 0 if ok else 1)
-
-    # ── API key management ────────────────────────────────
+        _exit_json({
+            "ok": ok,
+            "model": get_model(),
+            "supported": SUPPORTED_MODELS,
+        }, 0 if ok else 1)
 
     elif command == "get-api-key":
-        provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
-        _exit_json({"ok": True, "has_key": has_api_key(provider), "provider": provider})
+        provider = _arg(3, "openai")
+        _exit_json({
+            "ok": True,
+            "provider": provider,
+            "has_key": has_api_key(provider),
+        })
 
     elif command == "set-api-key":
-        key      = sys.argv[3] if len(sys.argv) > 3 else ""
-        provider = sys.argv[4] if len(sys.argv) > 4 else "openai"
-        print(f"[set-api-key] provider={provider!r} key_len={len(key)} key_prefix={key[:6]!r}", file=sys.stderr)
-        print(f"[set-api-key] env_path={str(_env_path())}", file=sys.stderr)
-        print(f"[set-api-key] env_path_exists={_env_path().parent.exists()}", file=sys.stderr)
-        try:
-            ok = set_api_key(key, provider)
-            print(f"[set-api-key] set_api_key returned ok={ok}", file=sys.stderr)
-        except Exception as e:
-            print(f"[set-api-key] EXCEPTION: {e}", file=sys.stderr)
-            ok = False
-        _exit_json({"ok": ok}, 0 if ok else 1)
+        key = _arg(3)
+        provider = _arg(4, "openai")
+        ok = set_api_key(key, provider)
+        _exit_json({
+            "ok": ok,
+            "provider": provider,
+            "has_key": has_api_key(provider),
+        }, 0 if ok else 1)
 
     elif command == "remove-api-key":
-        provider = sys.argv[3] if len(sys.argv) > 3 else "openai"
+        provider = _arg(3, "openai")
         ok = remove_api_key(provider)
-        _exit_json({"ok": ok}, 0 if ok else 1)
-
-    # ── Balance ───────────────────────────────────────────
-
-    elif command == "get-balance":
-        result: Dict[str, Any] = {"ok": True}
-
-        # Connectonion balance — read from connectonion balance API if available
-        try:
-            from connectonion import get_balance as _co_balance
-            co = _co_balance()
-            result["connectonion"] = {
-                "balance_usd":    co.get("balance_usd") or co.get("balance"),
-                "total_cost_usd": co.get("total_cost_usd") or co.get("used"),
-            }
-        except Exception:
-            result["connectonion"] = {"balance_usd": None, "total_cost_usd": None}
-
-        # OpenAI balance — only attempt if key exists
-        if has_api_key("openai"):
-            try:
-                import urllib.request
-                req = urllib.request.Request(
-                    "https://api.openai.com/v1/dashboard/billing/credit_grants",
-                    headers={"Authorization": f"Bearer {get_api_key('openai')}"},
-                )
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    data = json.loads(resp.read())
-                result["openai"] = {
-                    "balance_usd": data.get("total_available"),
-                    "plan": None,
-                }
-            except Exception:
-                result["openai"] = {"balance_usd": None, "plan": "Pay as you go"}
-        else:
-            result["openai"] = {"balance_usd": None, "plan": None}
-
-        _exit_json(result)
+        _exit_json({
+            "ok": ok,
+            "provider": provider,
+            "has_key": has_api_key(provider),
+        }, 0 if ok else 1)
 
     elif command == "set-profile":
-        name         = sys.argv[3] if len(sys.argv) > 3 else ""
-        email        = sys.argv[4] if len(sys.argv) > 4 else ""
-        organization = sys.argv[5] if len(sys.argv) > 5 else ""
-        role         = sys.argv[6] if len(sys.argv) > 6 else ""
+        name = _arg(3)
+        email = _arg(4)
+        organization = _arg(5)
+        role = _arg(6)
+
         profile = load_profile()
-        if name:         profile["name"]         = name
-        if email:        profile["email"]        = email
-        if organization: profile["organization"] = organization
-        if role:         profile["role"]         = role
+
+        if name:
+            profile["name"] = name
+        if email:
+            profile["email"] = email
+        if organization:
+            profile["organization"] = organization
+        if role:
+            profile["role"] = role
+
         save_profile(profile)
         invalidate_context_cache()
         _exit_json({"ok": True, "profile": profile})
@@ -325,38 +375,25 @@ if __name__ == "__main__":
     elif command == "get-profile":
         _exit_json({"ok": True, "profile": load_profile()})
 
-    elif command == "get-history":
-        data  = load_history()
-        items = list(reversed(data.get("items", [])))
-        _exit_json({"items": items[:100]})
-
     elif command == "save-profile":
-        data = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
+        data = json.loads(_arg(3, "{}"))
+
         complete_onboarding(
-            career_area   = data.get("career_area", ""),
-            usage_type    = data.get("usage_type", []),
-            writing_style = data.get("writing_style", "casual"),
-            language      = data.get("language", ""),
+            career_area=data.get("career_area", ""),
+            usage_type=data.get("usage_type", []),
+            writing_style=data.get("writing_style", "casual"),
+            language=data.get("language", ""),
         )
+
         _exit_json({"ok": True, "profile": load_profile()})
 
     elif command == "is-first-launch":
-        _exit_json({"first_launch": is_first_launch()})
+        _exit_json({"ok": True, "first_launch": is_first_launch()})
 
-    elif command == "list-insertions":
-        from storage import load_text_insertions
-        _exit_json({"ok": True, "insertions": load_text_insertions()})
-
-    elif command == "save-insertion":
-        from storage import save_text_insertion
-        label = sys.argv[3] if len(sys.argv) > 3 else ""
-        value = sys.argv[4] if len(sys.argv) > 4 else ""
-        _exit_json({"ok": save_text_insertion(label, value)})
-
-    elif command == "remove-insertion":
-        from storage import remove_text_insertion
-        label = sys.argv[3] if len(sys.argv) > 3 else ""
-        _exit_json({"ok": remove_text_insertion(label)})
+    elif command == "get-history":
+        data = load_history()
+        items = list(reversed(data.get("items", [])))
+        _exit_json({"ok": True, "items": items[:100]})
 
     elif command == "clear-history":
         save_store("history.json", {"items": []})
@@ -368,42 +405,87 @@ if __name__ == "__main__":
 
     elif command == "clear-snippets":
         (app_support_dir() / "snippets.json").write_text(
-            json.dumps({"snippets": []}, indent=2), encoding="utf-8"
+            json.dumps({"snippets": []}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         _exit_json({"ok": True})
 
     elif command == "reset-profile":
-        save_profile({
-            "name": "", "email": "", "organization": "", "role": "",
-            "preferences": {"target_language": get_target_language()},
-            "learned": {"description": "", "last_updated": 0},
+        profile = load_profile()
+
+        profile.update({
+            "name": "",
+            "email": "",
+            "organization": "",
+            "role": "",
+            "career_area": "",
+            "usage_type": [],
+            "writing_style": "",
+            "onboarding_done": False,
+            "learned": {
+                "description": "",
+                "habits": [],
+                "frequent_apps": [],
+                "last_updated": 0,
+            },
         })
+
+        save_profile(profile)
         invalidate_context_cache()
-        _exit_json({"ok": True})
+        _exit_json({"ok": True, "profile": profile})
 
     elif command == "reset-all":
-        from agents.plugins.session import clear_session
         clear_session()
-        save_store("history.json",    {"items": []})
+        save_store("history.json", {"items": []})
         save_store("dictionary.json", {"terms": []})
+
         (app_support_dir() / "snippets.json").write_text(
-            json.dumps({"snippets": []}, indent=2), encoding="utf-8"
+            json.dumps({"snippets": []}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        save_profile({
-            "name": "", "email": "", "organization": "", "role": "",
-            "preferences": {"target_language": get_target_language()},
-            "learned": {"description": "", "last_updated": 0},
+
+        profile = load_profile()
+        profile.update({
+            "name": "",
+            "email": "",
+            "organization": "",
+            "role": "",
+            "career_area": "",
+            "usage_type": [],
+            "writing_style": "",
+            "onboarding_done": False,
+            "text_insertions": [],
+            "learned": {
+                "description": "",
+                "habits": [],
+                "frequent_apps": [],
+                "last_updated": 0,
+            },
         })
+
+        save_profile(profile)
         invalidate_context_cache()
+
         _exit_json({"ok": True})
 
-    elif command == "calendar":
-        text = sys.argv[3] if len(sys.argv) > 3 else "today"
-        _exit_json({"output": run_calendar(text, text)})
+    elif command == "list-insertions":
+        from storage import load_text_insertions
+        _exit_json({"ok": True, "insertions": load_text_insertions()})
+
+    elif command == "save-insertion":
+        from storage import save_text_insertion
+
+        label = _arg(3)
+        value = _arg(4)
+
+        _exit_json({"ok": save_text_insertion(label, value)})
+
+    elif command == "remove-insertion":
+        from storage import remove_text_insertion
+
+        label = _arg(3)
+
+        _exit_json({"ok": remove_text_insertion(label)})
 
     else:
-        audio_path      = sys.argv[2]
-        app_name        = sys.argv[3] if len(sys.argv) > 3 else "unknown"
-        target_language = sys.argv[4] if len(sys.argv) > 4 else ""
-        result = transcribe_and_enhance_impl(audio_path, app_name, target_language)
-        _exit_json({"output": result.get("final_text", "")})
+        _exit_json({"ok": False, "error": f"unknown command: {command}"}, 1)

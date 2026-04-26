@@ -1,12 +1,13 @@
 """
 agents/refiner.py — Voice transcription cleaning and formatting subagent.
 
-Optimised version:
-  - Keeps dictionary/profile/language/snippet/session context
-  - Disables eval by default to reduce latency and cost
-  - Shows visibility logs only when WHISPR_DEBUG_LOGS=1
-  - Enables eval only when WHISPR_DEBUG_EVAL=1
+Agent-first version:
+- Always sends non-empty text to the refiner agent
+- Gives the agent active app name so it can decide format
+- Keeps dictionary/profile/language/snippet/session context
+- Keeps debug eval/logs disabled unless enabled by env flags
 """
+
 from __future__ import annotations
 
 import io as _io
@@ -24,25 +25,12 @@ from storage import (
     DEBUG_EVAL,
     DEBUG_LOGS,
 )
+
 from agents.profile import inject_profile, update_profile_background
-from agents.dictionary_agent import inject_dictionary, update_dictionary_background
+from agents.dictionary_agent import inject_dictionary
 from agents.plugins.lang import inject_language
 from agents.plugins.session import inject_session
 from agents.plugins.snippets import inject_snippets
-
-
-_CODE_APPS = {
-    "terminal", "iterm", "iterm2", "warp", "hyper", "kitty", "alacritty",
-    "xterm", "bash", "zsh", "fish", "powershell", "cmd",
-    "vscode", "visual studio code", "cursor", "windsurf", "zed",
-    "pycharm", "intellij", "webstorm", "clion", "goland", "rider",
-    "xcode", "android studio", "sublime text", "vim", "neovim", "emacs",
-    "jupyter", "jupyter notebook", "jupyterlab",
-}
-
-
-def _is_code_app(app_name: str) -> bool:
-    return app_name.strip().lower() in _CODE_APPS
 
 
 def _set_intent(agent) -> None:
@@ -51,8 +39,8 @@ def _set_intent(agent) -> None:
 
 def _quick_clean(text: str) -> str:
     """
-    Fast local cleaning.
-    This runs before the LLM and reduces unnecessary cleanup work.
+    Lightweight local cleanup before the agent.
+    This does not replace the agent; it only removes obvious noise.
     """
     text = apply_dictionary_corrections(text)
 
@@ -81,7 +69,6 @@ def _build_events(raw_text: str):
         after_user_input(inject_profile),
         after_user_input(inject_dictionary),
         before_llm(inject_language),
-        on_complete(update_dictionary_background),
         on_complete(update_profile_background),
     ]
 
@@ -98,10 +85,8 @@ def _build_events(raw_text: str):
 
 
 def _restore_placeholders(agent, result: str) -> str:
-    placeholders: dict = {}
-
-    if getattr(agent, "current_session", None):
-        placeholders = agent.current_session.get("snippet_placeholders", {}) or {}
+    session = getattr(agent, "current_session", None) or {}
+    placeholders = session.get("snippet_placeholders", {}) or {}
 
     for placeholder, expansion in placeholders.items():
         result = result.replace(placeholder, expansion)
@@ -109,7 +94,7 @@ def _restore_placeholders(agent, result: str) -> str:
     return result
 
 
-def run(text: str, app_name: str) -> str:
+def run(text: str, app_name: str = "unknown") -> str:
     """
     Clean and format raw transcribed speech.
     """
@@ -119,64 +104,86 @@ def run(text: str, app_name: str) -> str:
     if not raw_text:
         return ""
 
-    is_code = _is_code_app(app_name)
-    cleaned = raw_text if is_code else _quick_clean(raw_text)
-
-    has_cjk = bool(re.search(r"[一-鿿가-힯]", raw_text))
-
-    # Very short English text does not need LLM.
-    # Do not bypass code apps because even short commands need formatting.
-    if not is_code and not has_cjk and len(cleaned.split()) < 3:
-        return cleaned
+    cleaned = _quick_clean(raw_text)
 
     agent = Agent(
         model=get_agent_model(),
         name="whispr_refiner",
         system_prompt=(
-            "You are a voice transcription cleaner.\n"
-            "Your job is to turn raw speech transcription into polished text.\n\n"
+            "You are a voice transcription cleaner and formatter.\n"
+            "Your job is to convert raw speech transcription into clean, accurate, and context-aware text.\n\n"
 
-            "Core rules:\n"
-            "1. Fix phonetic mishearings using known dictionary terms.\n"
-            "2. Remove filler words and stutters such as uh, um, like, so, basically, you know.\n"
-            "3. Preserve the user's meaning. Do not add new facts.\n"
-            "4. Fix punctuation, spacing, and capitalisation.\n"
-            "5. Respect the target output language from system context.\n"
-            "6. Match the user's writing style from profile context.\n\n"
+            "Core principles:\n"
+            "1. Preserve the user's meaning exactly. Never add new facts or assumptions.\n"
+            "2. Fix transcription errors, including phonetic mishearings, using known dictionary terms.\n"
+            "3. Remove filler words and disfluencies such as 'uh', 'um', 'like', 'so', 'basically', 'you know'.\n"
+            "4. Fix grammar, punctuation, spacing, and capitalisation.\n"
+            "5. Respect the target output language provided in system context.\n"
+            "6. Match the user's writing style from profile context when available.\n\n"
 
-            "List formatting rules:\n"
-            "- Format as a numbered list whenever the user gives multiple distinct points,\n"
-            "  steps, or ideas — even if they use natural connectors like 'first', 'second',\n"
-            "  'third', 'also', 'and then', 'next', 'another thing is', 'on top of that'.\n"
-            "- Each list item should be a clean, complete sentence.\n"
-            "- Use a numbered list (1. 2. 3.) not bullets.\n"
-            "- Keep as prose only when ideas flow together as a single connected thought.\n\n"
+            "Formatting rules:\n"
+            "- Convert fragmented speech into natural, well-structured text.\n"
+            "- Use paragraphs for continuous ideas.\n"
+            "- Use numbered lists ONLY when the user clearly expresses multiple distinct steps, points, or items.\n"
+            "- Do NOT force a list if the content is naturally a single idea.\n"
+            "- Each list item must be a complete, clean sentence.\n\n"
 
-            "App formatting rules:\n"
-            "- Mail: produce a complete email when the user clearly dictates an email.\n"
-            "- Slack/Teams/Chat: keep it concise and conversational.\n"
-            "- Notes/Docs: use clean paragraphs or numbered lists as appropriate.\n"
-            "- Terminal/code editor: convert natural speech directly into the correct shell\n"
-            "  command or code. Apply these package manager conventions automatically:\n"
-            "    * 'install X' or 'pip install X' → pip install X\n"
-            "    * 'conda install X' or 'activate env Y' → conda install X / conda activate Y\n"
-            "    * 'npm install X' or 'brew install X' → use that manager's syntax\n"
-            "    * Multiple packages in one sentence → single command with all packages\n"
-            "  Do not add markdown fences. Preserve flags, paths, and identifiers exactly.\n\n"
+            "App-aware behaviour:\n"
+            "- You will receive the active app name as context.\n"
+            "- Infer the correct output format based on BOTH the app name AND the user's intent.\n"
+            "- Do NOT rely on a fixed list of apps. Reason dynamically.\n\n"
+
+            "When deciding format:\n"
+            "- If the context suggests coding, terminal, shell, or developer tools:\n"
+            "  Output the correct command or code directly.\n"
+            "  Combine multiple packages into one command when appropriate.\n"
+            "  Preserve flags, paths, filenames, identifiers, and quoted strings exactly.\n"
+            "  Do NOT add markdown formatting.\n\n"
+
+            "- If the context suggests email or formal communication:\n"
+            "  Only generate a full email when the user clearly dictates one.\n"
+            "  Otherwise, keep it as a normal sentence or paragraph.\n\n"
+
+            "- If the context suggests chat or messaging:\n"
+            "  Keep the tone concise and conversational.\n\n"
+
+            "- If the context suggests notes, documents, or writing tools:\n"
+            "  Use structured paragraphs or lists when appropriate.\n\n"
+
+            "- If the app context is unclear:\n"
+            "  Default to clean, neutral, well-formatted text.\n\n"
 
             "Snippet rules:\n"
-            "- Preserve placeholders like «S0» exactly. Do not translate or remove them.\n\n"
-            
+            "- Preserve placeholders like «S0» exactly.\n"
+            "- Do NOT translate, remove, or modify placeholders.\n\n"
+
+            "Strict constraints:\n"
+            "- Do NOT invent content.\n"
+            "- Do NOT over-format.\n"
+            "- Do NOT change meaning.\n"
+            "- Do NOT add explanations.\n\n"
+
+            "Context-awareness rules:\n"
+            "- Recent conversation context may be provided.\n"
+            "- Decide whether the current input depends on previous context by meaning, not keywords.\n"
+            "- If it is a follow-up, revise or transform the previous assistant output.\n"
+            "- If it is independent, ignore the previous context.\n"
+            "- Do NOT output the follow-up instruction itself.\n\n"
+
             "Output rules:\n"
             "- Output ONLY the final cleaned text.\n"
             "- No preamble.\n"
-            "- No explanation.\n"
-            "- No follow-up suggestions."
+            "- No commentary.\n"
+            "- No extra text."
         ),
         on_events=_build_events(raw_text),
     )
 
-    prompt = f"[App: {app_name}]\n{cleaned}" if app_name != "unknown" else cleaned
+    prompt = (
+        f"Active app: {app_name}\n"
+        f"Raw transcription:\n{cleaned}\n\n"
+        "Decide the best final output format based on the active app and user intent."
+    )
 
     result = str(agent.input(prompt)).strip()
     result = result.strip('"').strip("'").strip()

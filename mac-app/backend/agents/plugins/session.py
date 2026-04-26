@@ -117,12 +117,20 @@ def is_followup(text: str) -> bool:
 
 
 def inject_session(agent) -> None:
-    """after_user_input — inject persisted session history as system message."""
     context = get_session_context()
+
     if context:
         agent.current_session["messages"].append({
-            "role":    "system",
-            "content": f"Recent conversation context (use this to inform your response):\n{context}",
+            "role": "system",
+            "content": (
+                "Recent conversation context is provided below.\n"
+                "Decide whether the current user input depends on this context.\n"
+                "If the current input is a continuation, correction, rewrite request, tone change, "
+                "translation request, shortening/expanding request, or refers to previous content implicitly, "
+                "use the previous assistant output as the source text.\n"
+                "If the current input is independent, ignore this context.\n\n"
+                f"{context}"
+            ),
         })
 
 
