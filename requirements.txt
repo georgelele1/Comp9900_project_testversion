@@ -1,0 +1,17 @@
+# Whispr backend dependencies
+# Auto-installed on first launch via run.sh
+
+connectonion
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+requests>=2.25.0
+httpx>=0.24.0
+pydantic>=2.0.0
+rich>=13.0.0
+click>=8.0.0
+typer>=0.20.0
+uvicorn>=0.20.0
+websockets>=11.0.0
+pytz>=2024.1
+# mac Calendar (used by gcalendar.py)
+pyobjc-framework-EventKit
