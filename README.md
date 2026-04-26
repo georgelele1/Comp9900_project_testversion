@@ -136,6 +136,17 @@ Provider is detected automatically from the key prefix when you paste it.
 ### AI Profile Learning
 After every 50 transcriptions, Whispr quietly analyses your usage patterns and updates a personal profile — your career area, writing style, frequent apps, and recurring topics. This makes every subsequent transcription more accurate for your context. No data leaves your machine.
 
+### Context Awareness (Session Memory)
+
+Whispr remembers recent interactions within a short time window and can
+understand follow-up instructions like:
+
+- "make it shorter"
+- "make it more polite"
+- "add one more point to it"
+
+The system automatically decides whether to use previous context or treat
+the input independently — no trigger words required.
 ---
 
 ## Menu Bar
@@ -167,7 +178,18 @@ View, add, edit, and delete your personal dictionary terms and their aliases.
 
 ### Snippets
 View, add, edit, and delete your voice snippet shortcuts.
+### Context Awareness (Session Memory)
 
+Whispr remembers recent interactions within a short time window and can
+understand follow-up instructions like:
+
+- "make it shorter"
+- "make it more polite"
+- "add one more point"
+- "translate it"
+
+The system automatically decides whether to use previous context or treat
+the input independently — no trigger words required.
 ### Shortcuts
 Customise the start and stop recording hotkeys. Click a shortcut pill to record a new key combination. Requires at least one modifier key (⌘ ⌃ ⌥ ⇧).
 
