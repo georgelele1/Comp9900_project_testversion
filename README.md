@@ -210,13 +210,7 @@ The test suite exercises the full backend pipeline — transcription cleaning, a
 
 ### Prerequisites
 
-Make sure the Python virtual environment is set up (see [Installation](#installation) step 2), then activate it:
-
-```bash
-source mac-app/runtime/venv/bin/activate
-```
-
-Or if you installed dependencies globally / in another venv, just ensure all `requirements.txt` packages are available.
+Make sure the Python virtual environment is set up by running `scripts.sh` (see [Installation](#installation) step 2). The venv is linked automatically — no activation needed.
 
 ### Run all tests
 
@@ -352,30 +346,3 @@ whispr/
 - API keys are stored in `~/Library/Application Support/Whispr/.env` — local only.
 
 ---
-
-## Troubleshooting
-
-**Hotkeys not working**
-Go to System Settings → Privacy & Security → Accessibility and make sure Whispr is enabled.
-
-**Transcription returns empty**
-Check that the microphone is not muted and Whispr has microphone permission in System Settings → Privacy & Security → Microphone.
-
-**"Failed to save API key"**
-Ensure the app has been built and deployed correctly so `app.py` can load without import errors. Check Xcode's debug console for Python tracebacks.
-
-**Backend not found**
-Ensure `requirements.txt` packages are installed and the Python venv is correctly bundled inside the app's resources at `runtime/venv/bin/python`.
-
-**Dictionary not learning**
-Dictionary auto-update runs every 5 transcriptions. You can also trigger it manually from Menu Bar → Update Dictionary. Check that `~/Library/Application Support/Whispr/dictionary_last_update.json` exists after the first update.
-
-**Test suite — `ModuleNotFoundError: No module named 'app'`**
-Run the test file from the `backend/` directory, or from the repo root using the full path:
-```bash
-python mac-app/backend/testall.py
-```
-The test file automatically adds its parent directory to `sys.path` so all backend modules resolve correctly.
-
-**Test suite — `Transcription failed after 3 attempts`**
-This means an empty audio path was passed to the transcription pipeline. Make sure you are using `_raw_text_override` (not `audio_path`) when calling `transcribe_and_enhance_impl` directly in tests. The test suite handles this automatically — if you see this error it is likely from a custom test case missing the override parameter.
