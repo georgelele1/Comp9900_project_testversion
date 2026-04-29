@@ -38,9 +38,23 @@ cd whispr
 
 ### 2. Install Python dependencies
 
+Run the setup script from the repo root:
+
 ```bash
-run the script.sh in env script page
+bash mac-app/envscripts/scripts.sh
 ```
+
+This script will:
+- Create a Python virtual environment at `mac-app/runtime/venv/`
+- Install all packages from `backend/requirements.txt`
+- Run a quick smoke test (`get-language`) to confirm the backend is working
+
+If you see `Runtime setup complete.` at the end, you're good to go.
+
+> **Note:** The script requires `python3.11`. If you have a different Python version, run it as:
+> ```bash
+> PYTHON_BIN=python3.12 bash mac-app/envscripts/scripts.sh
+> ```
 
 ### 3. Open and build the Xcode project
 
@@ -52,7 +66,9 @@ Build and run with **⌘R** in Xcode, or archive for distribution.
 
 ### 4. Grant permissions on first launch
 
-macOS will prompt for two permissions — both are required:(remember to assgin the teams in sign page without teams everytime the project run will be identify as a new batch so your permission can not be saved and granted)
+macOS will prompt for two permissions — both are required.
+
+> **Important:** Assign a development team in the Xcode project's **Signing & Capabilities** tab before building. Without a team, macOS treats each build as a new, unrecognised app and your granted permissions will not be saved between runs.
 
 | Permission | Why |
 |---|---|
@@ -88,7 +104,9 @@ Whispr is a transcription cleaner — it takes raw voice input and produces poli
 > → `The deadline has been moved to Friday.`
 
 > *"point one make sure the tests pass point two update the readme point three tag the release"*
-> → `1. Make sure the tests pass.\n2. Update the README.\n3. Tag the release.`
+> → `1. Make sure the tests pass.`
+> → `2. Update the README.`
+> → `3. Tag the release.`
 
 > *"install connectonion in my terminal"* (in Terminal)
 > → `pip install connectonion`
@@ -103,7 +121,7 @@ Teach Whispr how to spell your names, course codes, package names, and jargon so
 - Open **Whispr → Dictionary**
 - Add a **correct phrase** (e.g. `connectonion`) and **aliases** (e.g. `connector onion, connect onion`)
 - Corrections are applied before every transcription — no LLM call needed
-- The dictionary also **auto-learns** from your transcription history every 5 recordings, using sentence structure analysis (WHO and WHAT) to extract person names, package names, and technical terms automatically
+- The dictionary also **auto-learns** from your transcription history every 5 recordings, using sentence structure analysis to extract person names, package names, and technical terms automatically
 
 ### Voice Snippets
 Map a trigger phrase to any text or URL expansion.
@@ -137,16 +155,15 @@ Provider is detected automatically from the key prefix when you paste it.
 After every 50 transcriptions, Whispr quietly analyses your usage patterns and updates a personal profile — your career area, writing style, frequent apps, and recurring topics. This makes every subsequent transcription more accurate for your context. No data leaves your machine.
 
 ### Context Awareness (Session Memory)
-
-Whispr remembers recent interactions within a short time window and can
-understand follow-up instructions like:
+Whispr remembers recent interactions within a 60-minute window and understands follow-up instructions like:
 
 - "make it shorter"
 - "make it more polite"
 - "add one more point to it"
+- "translate it"
 
-The system automatically decides whether to use previous context or treat
-the input independently — no trigger words required.
+The system automatically decides whether to use previous context or treat the input independently — no trigger words required.
+
 ---
 
 ## Menu Bar
@@ -178,23 +195,102 @@ View, add, edit, and delete your personal dictionary terms and their aliases.
 
 ### Snippets
 View, add, edit, and delete your voice snippet shortcuts.
-### Context Awareness (Session Memory)
 
-Whispr remembers recent interactions within a short time window and can
-understand follow-up instructions like:
-
-- "make it shorter"
-- "make it more polite"
-- "add one more point"
-- "translate it"
-
-The system automatically decides whether to use previous context or treat
-the input independently — no trigger words required.
 ### Shortcuts
 Customise the start and stop recording hotkeys. Click a shortcut pill to record a new key combination. Requires at least one modifier key (⌘ ⌃ ⌥ ⇧).
 
 ### API Keys
 Select your AI model and manage API keys per provider. Keys are stored locally in `~/Library/Application Support/Whispr/.env` — never sent anywhere else.
+
+---
+
+## Running the Test Suite
+
+The test suite exercises the full backend pipeline — transcription cleaning, app-aware formatting, session memory, snippet expansion, and edge cases — without requiring audio input or a running macOS app.
+
+### Prerequisites
+
+Make sure the Python virtual environment is set up (see [Installation](#installation) step 2), then activate it:
+
+```bash
+source mac-app/runtime/venv/bin/activate
+```
+
+Or if you installed dependencies globally / in another venv, just ensure all `requirements.txt` packages are available.
+
+### Run all tests
+
+From the repo root:
+
+```bash
+python mac-app/backend/testall.py
+```
+
+Or from inside the backend directory:
+
+```bash
+cd mac-app/backend
+python testall.py
+```
+
+### What the suite covers
+
+| Suite | Cases | What it checks |
+|---|---|---|
+| **Single-turn tests** | 9 | Filler removal, list formatting, chat/email/terminal formatting, meaning preservation, grammar |
+| **Edge case tests** | 6 | Empty input, whitespace, CJK unicode, long input, filler-only input, numbers/IPs |
+| **Snippet tests** | 4 | Exact trigger expansion, case-insensitive match, no false expansion, multiple snippets |
+| **Session tests** | 4 | Shorten output, politeness change, add a step, language continuity across turns |
+
+### Example output
+
+```
+================================================================================
+SINGLE TURN TESTS
+================================================================================
+
+CASE : filler removal — quick_clean layer
+APP  : Notes
+IN   : 'uh so basically i think we should start the meeting now'
+OUT  : 'I think we should start the meeting now.'
+  ✅ PASS — filler removal — quick_clean layer
+
+CASE : terminal command — all packages, no markdown
+APP  : Terminal
+IN   : 'install numpy pandas matplotlib'
+OUT  : 'pip install numpy pandas matplotlib'
+  ✅ PASS — terminal command — all packages, no markdown
+
+...
+
+================================================================================
+FINAL RESULT
+================================================================================
+  Passed : 23
+  Failed : 0
+  Total  : 23
+```
+
+### Environment flags
+
+Two optional flags enable extra debug output during a test run:
+
+| Flag | Effect |
+|---|---|
+| `WHISPR_DEBUG_EVAL=1` | Enables the eval/retry loop — each output is scored and retried up to 2 times if it fails |
+| `WHISPR_DEBUG_LOGS=1` | Prints agent timing and tool call counts to stderr after each transcription |
+
+```bash
+WHISPR_DEBUG_EVAL=1 python mac-app/backend/testall.py
+```
+
+---
+
+## Changing Hotkeys
+
+Use the **Shortcuts** tab in the main window to record new key combinations without editing code. Changes take effect immediately.
+
+Defaults: `⌥ Space` to start, `⌥ S` to stop.
 
 ---
 
@@ -204,6 +300,10 @@ Select your AI model and manage API keys per provider. Keys are stored locally i
 whispr/
 ├── mac-app/
 │   ├── Whispr.xcodeproj
+│   ├── envscripts/
+│   │   └── scripts.sh                    # One-command venv + dependency setup
+│   ├── runtime/
+│   │   └── venv/                         # Auto-created by scripts.sh
 │   └── Sources/
 │       ├── AppManager.swift              # Core orchestrator + auto dictionary trigger
 │       ├── AudioRecorder.swift           # AVFoundation recording
@@ -223,13 +323,13 @@ whispr/
 │       ├── APIKeysView.swift
 │       ├── OnboardingView.swift
 │       ├── OnboardingTour.swift
-│       ├── FloatingIndicator.swift
 │       ├── WhisprTheme.swift
 │       └── BackendResponse.swift
 └── backend/
     ├── app.py                            # Main pipeline orchestrator
     ├── storage.py                        # JSON storage + multi-provider API key management
     ├── snippets.py                       # Snippet CRUD
+    ├── testall.py                        # Full backend test suite
     └── agents/
         ├── refiner.py                    # Transcription cleaning subagent
         ├── profile.py                    # User profile + background learning
@@ -241,14 +341,6 @@ whispr/
             ├── visibility.py             # Agent timing logs (debug only)
             └── eval.py                   # Output eval + retry loop (debug only)
 ```
-
----
-
-## Changing Hotkeys
-
-Use the **Shortcuts** tab in the main window to record new key combinations without editing code. Changes take effect immediately.
-
-Defaults: `⌥ Space` to start, `⌥ S` to stop.
 
 ---
 
@@ -277,3 +369,13 @@ Ensure `requirements.txt` packages are installed and the Python venv is correctl
 
 **Dictionary not learning**
 Dictionary auto-update runs every 5 transcriptions. You can also trigger it manually from Menu Bar → Update Dictionary. Check that `~/Library/Application Support/Whispr/dictionary_last_update.json` exists after the first update.
+
+**Test suite — `ModuleNotFoundError: No module named 'app'`**
+Run the test file from the `backend/` directory, or from the repo root using the full path:
+```bash
+python mac-app/backend/testall.py
+```
+The test file automatically adds its parent directory to `sys.path` so all backend modules resolve correctly.
+
+**Test suite — `Transcription failed after 3 attempts`**
+This means an empty audio path was passed to the transcription pipeline. Make sure you are using `_raw_text_override` (not `audio_path`) when calling `transcribe_and_enhance_impl` directly in tests. The test suite handles this automatically — if you see this error it is likely from a custom test case missing the override parameter.
